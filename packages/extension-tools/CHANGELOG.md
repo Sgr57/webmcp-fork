@@ -1,5 +1,12 @@
 # @mcp-b/extension-tools
 
+## 2.2.1
+
+### Patch Changes
+
+- @mcp-b/smart-dom-reader@2.2.1
+- @mcp-b/webmcp-ts-sdk@2.2.1
+
 ## 2.2.0
 
 ### Patch Changes
