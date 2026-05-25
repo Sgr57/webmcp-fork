@@ -29,6 +29,11 @@ import {
   type ServerHelloMessage,
 } from './schemas.js';
 
+/**
+ * Default timeout for in-flight `resources/read` requests.
+ */
+const READ_RESOURCE_TIMEOUT_MS = 15_000;
+
 const RELAY_BROWSER_PROTOCOL = 'webmcp.v1';
 const RELAY_DISCOVERY_PROTOCOL = 'webmcp-discovery.v1';
 const RELAY_INTERNAL_PROTOCOL = 'webmcp-relay.v1';
@@ -49,6 +54,35 @@ interface PendingInvocation {
   connectionId: string;
   timeoutId: ReturnType<typeof setTimeout>;
   resolve: (result: RelayCallToolResult) => void;
+  reject: (error: Error) => void;
+}
+
+/**
+ * Browser resource descriptor cached per connection.
+ *
+ * The relay holds these in memory only; it does not interpret the payload.
+ * MCP Apps `_meta.ui.*` fields and arbitrary additional properties are
+ * forwarded to MCP clients verbatim via the `unknown` index signature.
+ */
+export interface RelayResourceDescriptor {
+  uri: string;
+  name: string;
+  title?: string;
+  description?: string;
+  mimeType?: string;
+  [key: string]: unknown;
+}
+
+/**
+ * In-flight `resources/read` request waiting for a browser `resource-result`
+ * message. Indexed by `callId` in a map disjoint from `pendingInvocations`
+ * to avoid namespace collisions between tool calls and resource reads.
+ */
+interface PendingResourceRead {
+  callId: string;
+  connectionId: string;
+  timeoutId: ReturnType<typeof setTimeout>;
+  resolve: (result: unknown) => void;
   reject: (error: Error) => void;
 }
 
@@ -151,6 +185,13 @@ export class RelayBridgeServer extends EventEmitter {
   private wss: WebSocketServer | null = null;
   private readonly socketByConnectionId = new Map<string, WebSocket>();
   private readonly pendingInvocations = new Map<string, PendingInvocation>();
+  /**
+   * Resource lists pushed by browser sources, keyed by connectionId. The
+   * relay merges these into a single response when an MCP client calls
+   * `resources/list`.
+   */
+  private readonly resourcesByConnectionId = new Map<string, RelayResourceDescriptor[]>();
+  private readonly pendingResourceReads = new Map<string, PendingResourceRead>();
   private readonly relayClientConnectionIds = new Set<string>();
   private readonly heartbeatIntervalByConnectionId = new Map<
     string,
@@ -400,6 +441,13 @@ export class RelayBridgeServer extends EventEmitter {
     }
     this.pendingInvocations.clear();
 
+    for (const pending of this.pendingResourceReads.values()) {
+      clearTimeout(pending.timeoutId);
+      pending.reject(new Error('Relay server stopped before resource read completed'));
+    }
+    this.pendingResourceReads.clear();
+    this.resourcesByConnectionId.clear();
+
     const wss = this.wss;
     this.wss = null;
 
@@ -456,6 +504,101 @@ export class RelayBridgeServer extends EventEmitter {
     }
 
     return this.invokeToolLocally(toolName, args, options);
+  }
+
+  /**
+   * Returns the union of resources advertised by all connected browser
+   * sources. UI-only resources (those referenced via tool `_meta.ui.resourceUri`)
+   * may be omitted by sources per MCP Apps spec 2026-01-26; the relay does not
+   * synthesize or filter, it merely forwards.
+   *
+   * Client mode currently returns an empty list — relay-to-relay forwarding
+   * for resources is out of scope for Phase 1 of the MCP Apps work.
+   */
+  listResources(): RelayResourceDescriptor[] {
+    if (this._mode === 'client') {
+      return [];
+    }
+
+    const seen = new Set<string>();
+    const all: RelayResourceDescriptor[] = [];
+    for (const resources of this.resourcesByConnectionId.values()) {
+      for (const resource of resources) {
+        if (seen.has(resource.uri)) {
+          continue;
+        }
+        seen.add(resource.uri);
+        all.push(resource);
+      }
+    }
+    return all;
+  }
+
+  /**
+   * Reads a resource by URI from whichever browser source advertised it.
+   *
+   * Returns the raw `result` payload sent by the browser. Caller is expected
+   * to validate against the MCP `ReadResourceResult` schema before forwarding
+   * to the MCP client.
+   */
+  async readResource(uri: string): Promise<unknown> {
+    if (this._mode === 'client') {
+      throw new Error('readResource is not supported in client mode');
+    }
+
+    let owningConnectionId: string | undefined;
+    for (const [connectionId, resources] of this.resourcesByConnectionId.entries()) {
+      if (resources.some((r) => r.uri === uri)) {
+        owningConnectionId = connectionId;
+        break;
+      }
+    }
+
+    if (!owningConnectionId) {
+      throw new Error(`No browser source advertises resource "${uri}"`);
+    }
+
+    const socket = this.socketByConnectionId.get(owningConnectionId);
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      throw new Error(
+        `Resource source ${owningConnectionId} disconnected before read of "${uri}"`
+      );
+    }
+
+    const callId = randomUUID();
+
+    return new Promise<unknown>((resolve, reject) => {
+      const timeoutId = setTimeout(() => {
+        this.pendingResourceReads.delete(callId);
+        reject(new Error(`Resource read for "${uri}" timed out after ${READ_RESOURCE_TIMEOUT_MS}ms`));
+      }, READ_RESOURCE_TIMEOUT_MS);
+
+      this.pendingResourceReads.set(callId, {
+        callId,
+        connectionId: owningConnectionId,
+        timeoutId,
+        resolve,
+        reject,
+      });
+
+      const message: RelayToBrowserMessage = {
+        type: 'read-resource',
+        callId,
+        uri,
+      };
+
+      try {
+        socket.send(JSON.stringify(message));
+      } catch (err) {
+        clearTimeout(timeoutId);
+        this.pendingResourceReads.delete(callId);
+        reject(
+          new Error(
+            `Failed to send resource read for "${uri}": ${err instanceof Error ? err.message : err}`
+          )
+        );
+      }
+    });
   }
 
   private async startAsServer(port = this.desiredPort): Promise<void> {
@@ -745,6 +888,30 @@ export class RelayBridgeServer extends EventEmitter {
           params: message.params,
         });
         break;
+
+      case 'resources/list':
+      case 'resources/changed':
+        this.resourcesByConnectionId.set(
+          connectionId,
+          message.resources as RelayResourceDescriptor[]
+        );
+        this.emit('resourcesChanged');
+        break;
+
+      case 'resource-result': {
+        const pending = this.pendingResourceReads.get(message.callId);
+        if (!pending) {
+          process.stderr.write(
+            `[webmcp-local-relay] warn: received resource-result for unknown callId ${message.callId}\n`
+          );
+          break;
+        }
+
+        clearTimeout(pending.timeoutId);
+        this.pendingResourceReads.delete(message.callId);
+        pending.resolve(message.result);
+        break;
+      }
     }
   }
 
@@ -893,7 +1060,11 @@ export class RelayBridgeServer extends EventEmitter {
     this.relayClientConnectionIds.delete(connectionId);
     this.registry.removeConnection(connectionId);
     this.socketByConnectionId.delete(connectionId);
+    const hadResources = this.resourcesByConnectionId.delete(connectionId);
     this.emit('stateChanged');
+    if (hadResources) {
+      this.emit('resourcesChanged');
+    }
 
     for (const [callId, pending] of this.pendingInvocations.entries()) {
       if (pending.connectionId !== connectionId) {
@@ -903,6 +1074,16 @@ export class RelayBridgeServer extends EventEmitter {
       clearTimeout(pending.timeoutId);
       this.pendingInvocations.delete(callId);
       pending.reject(new Error(`Tool source ${connectionId} disconnected during invocation`));
+    }
+
+    for (const [callId, pending] of this.pendingResourceReads.entries()) {
+      if (pending.connectionId !== connectionId) {
+        continue;
+      }
+
+      clearTimeout(pending.timeoutId);
+      this.pendingResourceReads.delete(callId);
+      pending.reject(new Error(`Resource source ${connectionId} disconnected during read`));
     }
   }
 

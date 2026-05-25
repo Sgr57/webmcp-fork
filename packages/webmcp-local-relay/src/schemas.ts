@@ -81,6 +81,60 @@ export const BrowserElicitationRequestSchema = z.object({
 });
 
 /**
+ * Schema for a single resource descriptor exposed by a browser source.
+ *
+ * Mirrors the MCP `Resource` shape (per spec 2026-01-26). Optional fields
+ * cover MCP Apps widget metadata (`_meta.ui.*`) but are validated permissively
+ * — the relay merely forwards them to the MCP client.
+ */
+export const BrowserResourceDescriptorSchema = z.looseObject({
+  uri: z.string().min(1),
+  name: z.string().min(1),
+  title: z.string().optional(),
+  description: z.string().optional(),
+  mimeType: z.string().optional(),
+});
+
+/**
+ * Schema for the full resource-list synchronization message pushed by the
+ * browser. The relay caches the list per-connection and forwards it to MCP
+ * clients via `resources/list` responses.
+ *
+ * Per MCP Apps spec (2026-01-26): "Servers MAY omit UI-only resources from
+ * `resources/list`" since discovery happens via `_meta.ui.resourceUri` in
+ * tool metadata. The relay still supports listing for forward-compat and
+ * for hosts that probe via `resources/list`.
+ */
+export const BrowserResourcesListMessageSchema = z.object({
+  type: z.literal('resources/list'),
+  resources: z.array(BrowserResourceDescriptorSchema),
+});
+
+/**
+ * Schema for resource-changed notification pushed after initial registration.
+ *
+ * Processing is identical to `resources/list` — the full resource set replaces
+ * any previously registered resources — but the distinct type signals a
+ * dynamic update rather than an initial handshake.
+ */
+export const BrowserResourcesChangedMessageSchema = z.object({
+  type: z.literal('resources/changed'),
+  resources: z.array(BrowserResourceDescriptorSchema),
+});
+
+/**
+ * Schema for the response a browser source sends in reply to a
+ * `read-resource` request. The `result` payload is held permissive and
+ * validated/normalized against the SDK's `ReadResourceResult` shape on the
+ * MCP server side before being returned to the client.
+ */
+export const BrowserResourceReadResultSchema = z.object({
+  type: z.literal('resource-result'),
+  callId: z.string().min(1),
+  result: z.unknown(),
+});
+
+/**
  * Union schema for all browser-to-relay protocol messages.
  */
 export const BrowserToRelayMessageSchema = z.discriminatedUnion('type', [
@@ -90,6 +144,9 @@ export const BrowserToRelayMessageSchema = z.discriminatedUnion('type', [
   BrowserToolResultMessageSchema,
   BrowserPongMessageSchema,
   BrowserElicitationRequestSchema,
+  BrowserResourcesListMessageSchema,
+  BrowserResourcesChangedMessageSchema,
+  BrowserResourceReadResultSchema,
 ]);
 
 /**
@@ -196,6 +253,19 @@ export const RelayElicitationResponseSchema = z.object({
 });
 
 /**
+ * Schema for relay read-resource messages sent to browser sources.
+ *
+ * When an MCP client issues `resources/read`, the relay forwards the URI
+ * to the browser via this message. The browser replies with a
+ * `resource-result` message keyed on the same `callId`.
+ */
+export const RelayReadResourceMessageSchema = z.object({
+  type: z.literal('read-resource'),
+  callId: z.string().min(1),
+  uri: z.string().min(1),
+});
+
+/**
  * Union schema for all relay-to-browser protocol messages.
  */
 export const RelayToBrowserMessageSchema = z.discriminatedUnion('type', [
@@ -206,6 +276,7 @@ export const RelayToBrowserMessageSchema = z.discriminatedUnion('type', [
   RelayPingMessageSchema,
   RelayReloadMessageSchema,
   RelayElicitationResponseSchema,
+  RelayReadResourceMessageSchema,
 ]);
 
 /**

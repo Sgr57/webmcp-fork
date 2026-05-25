@@ -3,7 +3,12 @@ import { execFile } from 'node:child_process';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
-import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import {
+  ListResourcesRequestSchema,
+  ListToolsRequestSchema,
+  type ReadResourceResult,
+  ReadResourceRequestSchema,
+} from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod/v4';
 
 import { RelayBridgeServer, type RelayBridgeServerOptions } from './bridgeServer.js';
@@ -91,10 +96,21 @@ export class LocalRelayMcpServer {
   constructor(options: LocalRelayMcpServerOptions = {}) {
     this.bridge = options.bridge ?? new RelayBridgeServer(options.bridgeOptions);
 
-    this.mcpServer = new McpServer({
-      name: options.serverName ?? 'webmcp-local-relay',
-      version: options.serverVersion ?? '0.0.0',
-    });
+    this.mcpServer = new McpServer(
+      {
+        name: options.serverName ?? 'webmcp-local-relay',
+        version: options.serverVersion ?? '0.0.0',
+      },
+      {
+        capabilities: {
+          // Declare resources support so MCP clients route resources/list and
+          // resources/read to the relay. Resource state is populated dynamically
+          // from connected browser sources; an empty list is returned when none
+          // are advertised. `listChanged` mirrors how tools are advertised.
+          resources: { listChanged: true },
+        },
+      }
+    );
 
     this.bridge.on('stateChanged', () => {
       void this.syncDynamicTools().catch((err) => {
@@ -133,6 +149,22 @@ export class LocalRelayMcpServer {
 
     this.registerStaticTools();
     this.overrideListToolsHandler();
+    this.registerResourcesHandlers();
+
+    // Forward browser-side resource list updates to the MCP client. Mirrors
+    // the existing tool-list change propagation in `applyDynamicTools`.
+    this.bridge.on('resourcesChanged', () => {
+      if (!this.connected) {
+        return;
+      }
+      try {
+        this.mcpServer.sendResourceListChanged();
+      } catch (err) {
+        process.stderr.write(
+          `[webmcp-local-relay] warn: failed to send resource list changed notification: ${err instanceof Error ? err.message : String(err)}\n`
+        );
+      }
+    });
   }
 
   /**
@@ -223,6 +255,28 @@ export class LocalRelayMcpServer {
       ].sort((left, right) => String(left.name).localeCompare(String(right.name)));
 
       return { tools };
+    });
+  }
+
+  /**
+   * Wires `resources/list` and `resources/read` handlers to the browser bridge.
+   *
+   * The relay maintains no local resource registry — every call is forwarded
+   * to whichever connected browser source advertised the URI. MCP Apps spec
+   * 2026-01-26 allows servers to omit UI-only resources from
+   * `resources/list` because hosts can discover them via `_meta.ui.resourceUri`
+   * on tool definitions; the relay forwards whatever browsers advertise.
+   */
+  private registerResourcesHandlers(): void {
+    this.mcpServer.server.setRequestHandler(ListResourcesRequestSchema, async () => {
+      const resources = this.bridge.listResources().map((resource) => ({ ...resource }));
+      return { resources };
+    });
+
+    this.mcpServer.server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+      const { uri } = request.params;
+      const result = (await this.bridge.readResource(uri)) as ReadResourceResult;
+      return result;
     });
   }
 
