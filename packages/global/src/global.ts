@@ -222,6 +222,38 @@ export function initializeWebModelContext(options?: WebModelContextInitOptions):
   server.syncNativeTools();
   syncToolsFromTestingShim(server);
 
+  // 3b. MCP Apps Phase 3: preserve the polyfill's `resources` namespace on the
+  // wrapper so that `navigator.modelContext.resources.register(...)` keeps
+  // working after `replaceModelContext(server)` swaps in the BrowserMcpServer.
+  //
+  // The polyfill installs `resources` as a non-writable own property on the
+  // raw modelContext instance (`PolyfillResourcesNamespace`). BrowserMcpServer
+  // has its OWN `registerResource`/`listResources`/`readResource` methods on a
+  // different shape (`registerResource(descriptor)`), but the relay embed
+  // bridge duck-types `navigator.modelContext.resources` with the polyfill
+  // shape (`register(uri, provider, options)` + `list()`/`read()`/
+  // `addEventListener('resourcechange', …)`). If we drop the polyfill's
+  // namespace, the embed cannot discover registered widgets.
+  //
+  // Mirror it through onto the server wrapper. We define it BEFORE
+  // replaceModelContext() so the wrapper exposes it from the first read.
+  const nativeResources = (native as unknown as { resources?: unknown }).resources;
+  if (nativeResources && typeof nativeResources === 'object') {
+    try {
+      Object.defineProperty(server, 'resources', {
+        configurable: true,
+        enumerable: true,
+        writable: false,
+        value: nativeResources,
+      });
+    } catch (err) {
+      console.warn(
+        '[WebModelContext] Failed to mirror native resources namespace onto wrapper:',
+        err
+      );
+    }
+  }
+
   // 4. Replace navigator.modelContext with the server.
   // Try own-property on the navigator instance first (works for polyfill and most cases).
   // Fall back to a prototype getter if the native property is non-configurable.

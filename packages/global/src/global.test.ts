@@ -171,6 +171,39 @@ describe('global adapter', () => {
     expect(typeof modelContext.ontoolchange).toBe('object');
   });
 
+  it('preserves the polyfill resources namespace on the wrapper (MCP Apps Phase 3)', () => {
+    initializeWebModelContext();
+
+    const mc = navigator.modelContext as unknown as {
+      resources?: {
+        register: (uri: string, provider: () => unknown, options?: unknown) => void;
+        unregister: (uri: string) => void;
+        list?: () => unknown[];
+        read?: (uri: string) => Promise<unknown>;
+        addEventListener: (type: string, listener: () => void) => void;
+      };
+    };
+
+    // The relay embed's duck-typed shape must match the polyfill's:
+    // register / unregister / list / read / addEventListener.
+    expect(mc.resources).toBeDefined();
+    expect(typeof mc.resources?.register).toBe('function');
+    expect(typeof mc.resources?.unregister).toBe('function');
+    expect(typeof mc.resources?.list).toBe('function');
+    expect(typeof mc.resources?.read).toBe('function');
+    expect(typeof mc.resources?.addEventListener).toBe('function');
+
+    // Round-trip register → list → read.
+    mc.resources?.register(
+      'ui://probe/widget',
+      async () => ({ text: '<p>hi</p>', mimeType: 'text/html;profile=mcp-app' }),
+      { name: 'probe-widget' }
+    );
+
+    const listed = mc.resources?.list?.() as Array<{ uri: string; name: string }> | undefined;
+    expect(listed?.some((r) => r.uri === 'ui://probe/widget')).toBe(true);
+  });
+
   it('registerTool returns a compatibility unregister handle and mirrors to native/testing API', async () => {
     initializeWebModelContext();
 
