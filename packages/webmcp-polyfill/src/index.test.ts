@@ -2358,4 +2358,262 @@ describe('@mcp-b/webmcp-polyfill', () => {
       ).rejects.toThrow('Instance type "array" is invalid. Expected "object"');
     });
   });
+
+  // =========================================================================
+  // MCP Apps Phase 2: navigator.modelContext.resources
+  // =========================================================================
+
+  describe('navigator.modelContext.resources', () => {
+    it('installs the resources namespace on navigator.modelContext', () => {
+      initializeWebMCPPolyfill();
+
+      const resources = navigator.modelContext.resources;
+      expect(resources).toBeDefined();
+      expect(typeof resources?.register).toBe('function');
+      expect(typeof resources?.unregister).toBe('function');
+    });
+
+    it('does not interfere with existing tool surface', async () => {
+      initializeWebMCPPolyfill();
+
+      navigator.modelContext.registerTool({
+        name: 'coexist_tool',
+        description: 'Coexistence smoke test',
+        inputSchema: { type: 'object', properties: {} },
+        execute: async () => ({ content: [{ type: 'text', text: 'hi' }] }),
+      });
+
+      // Register a resource at the same time.
+      const provider = vi.fn(async () => ({ text: '<div>x</div>', mimeType: 'text/html' }));
+      navigator.modelContext.resources?.register('ui://coexist/widget', provider);
+
+      const serialized = await navigator.modelContextTesting?.executeTool('coexist_tool', '{}');
+      expect(serialized).toContain('hi');
+    });
+
+    it('register() stores the resource and read() invokes the provider', async () => {
+      initializeWebMCPPolyfill();
+      const resources = navigator.modelContext.resources;
+      expect(resources).toBeDefined();
+      if (!resources) throw new Error('resources unavailable');
+
+      const provider = vi.fn(async () => ({
+        text: '<!doctype html><div>hello</div>',
+        mimeType: 'text/html;profile=mcp-app',
+      }));
+
+      resources.register('ui://test/widget.html', provider, {
+        name: 'widget',
+        description: 'Test widget',
+        mimeType: 'text/html;profile=mcp-app',
+      });
+
+      const internal = resources as unknown as {
+        list(): Array<Record<string, unknown>>;
+        read(uri: string): Promise<{ contents: Array<Record<string, unknown>> }>;
+      };
+      const list = internal.list();
+      expect(list).toEqual([
+        {
+          uri: 'ui://test/widget.html',
+          name: 'widget',
+          description: 'Test widget',
+          mimeType: 'text/html;profile=mcp-app',
+        },
+      ]);
+
+      const result = await internal.read('ui://test/widget.html');
+      expect(provider).toHaveBeenCalledTimes(1);
+      expect(result).toEqual({
+        contents: [
+          {
+            uri: 'ui://test/widget.html',
+            mimeType: 'text/html;profile=mcp-app',
+            text: '<!doctype html><div>hello</div>',
+          },
+        ],
+      });
+    });
+
+    it('register() defaults name to uri and tolerates omitted options', async () => {
+      initializeWebMCPPolyfill();
+      const resources = navigator.modelContext.resources;
+      if (!resources) throw new Error('resources unavailable');
+
+      resources.register('ui://default/name', async () => ({
+        text: 'x',
+        mimeType: 'text/plain',
+      }));
+
+      const list = (resources as unknown as { list(): Array<{ uri: string; name: string }> }).list();
+      expect(list[0]).toEqual({ uri: 'ui://default/name', name: 'ui://default/name' });
+    });
+
+    it('read() wraps blob providers into ReadResourceResult', async () => {
+      initializeWebMCPPolyfill();
+      const resources = navigator.modelContext.resources;
+      if (!resources) throw new Error('resources unavailable');
+
+      resources.register('ui://image/icon.png', async () => ({
+        blob: 'aGVsbG8=', // base64 "hello"
+        mimeType: 'image/png',
+        meta: { ui: { foo: 'bar' } },
+      }));
+
+      const result = await (
+        resources as unknown as {
+          read(uri: string): Promise<{ contents: Array<Record<string, unknown>> }>;
+        }
+      ).read('ui://image/icon.png');
+
+      expect(result.contents[0]).toEqual({
+        uri: 'ui://image/icon.png',
+        mimeType: 'image/png',
+        blob: 'aGVsbG8=',
+        _meta: { ui: { foo: 'bar' } },
+      });
+    });
+
+    it('forwards descriptor _meta to list() output', () => {
+      initializeWebMCPPolyfill();
+      const resources = navigator.modelContext.resources;
+      if (!resources) throw new Error('resources unavailable');
+
+      resources.register('ui://meta/widget', async () => ({ text: 'x', mimeType: 'text/plain' }), {
+        _meta: { ui: { resourceUri: 'ui://meta/widget' } },
+      });
+
+      const list = (resources as unknown as { list(): Array<Record<string, unknown>> }).list();
+      expect(list[0]).toMatchObject({
+        uri: 'ui://meta/widget',
+        _meta: { ui: { resourceUri: 'ui://meta/widget' } },
+      });
+    });
+
+    it('unregister() removes the entry and read() afterwards rejects', async () => {
+      initializeWebMCPPolyfill();
+      const resources = navigator.modelContext.resources;
+      if (!resources) throw new Error('resources unavailable');
+
+      resources.register('ui://gone/widget', async () => ({ text: 'x', mimeType: 'text/plain' }));
+      resources.unregister('ui://gone/widget');
+
+      const list = (resources as unknown as { list(): unknown[] }).list();
+      expect(list).toEqual([]);
+
+      await expect(
+        (
+          resources as unknown as {
+            read(uri: string): Promise<unknown>;
+          }
+        ).read('ui://gone/widget')
+      ).rejects.toThrow('Resource not registered: ui://gone/widget');
+    });
+
+    it('re-registering an existing uri replaces the previous provider', async () => {
+      initializeWebMCPPolyfill();
+      const resources = navigator.modelContext.resources;
+      if (!resources) throw new Error('resources unavailable');
+
+      const first = vi.fn(async () => ({ text: 'first', mimeType: 'text/plain' }));
+      const second = vi.fn(async () => ({ text: 'second', mimeType: 'text/plain' }));
+
+      resources.register('ui://replace/me', first);
+      resources.register('ui://replace/me', second);
+
+      const result = await (
+        resources as unknown as {
+          read(uri: string): Promise<{ contents: Array<{ text?: string }> }>;
+        }
+      ).read('ui://replace/me');
+      expect(first).not.toHaveBeenCalled();
+      expect(second).toHaveBeenCalledTimes(1);
+      expect(result.contents[0]?.text).toBe('second');
+    });
+
+    it('register() validates inputs and throws on bad arguments', () => {
+      initializeWebMCPPolyfill();
+      const resources = navigator.modelContext.resources;
+      if (!resources) throw new Error('resources unavailable');
+
+      expect(() => resources.register('', async () => ({ text: 'x', mimeType: 'text/plain' }))).toThrow();
+      expect(() =>
+        // @ts-expect-error wrong type
+        resources.register('ui://bad', 'not a function')
+      ).toThrow();
+    });
+
+    it('read() rejects when provider returns invalid payload', async () => {
+      initializeWebMCPPolyfill();
+      const resources = navigator.modelContext.resources;
+      if (!resources) throw new Error('resources unavailable');
+
+      // Missing both text and blob
+      resources.register('ui://bad/no-payload', async () => ({ mimeType: 'text/plain' } as never));
+      // Both text and blob
+      resources.register('ui://bad/both', async () => ({
+        text: 'x',
+        blob: 'eA==',
+        mimeType: 'text/plain',
+      } as never));
+      // Missing mimeType
+      resources.register('ui://bad/no-mime', async () => ({ text: 'x' } as never));
+
+      const read = (
+        resources as unknown as { read(uri: string): Promise<unknown> }
+      ).read.bind(resources);
+
+      await expect(read('ui://bad/no-payload')).rejects.toThrow('must return either "text" or "blob"');
+      await expect(read('ui://bad/both')).rejects.toThrow('returned both "text" and "blob"');
+      await expect(read('ui://bad/no-mime')).rejects.toThrow('non-empty "mimeType"');
+    });
+
+    it('dispatches resourcechange events on register/unregister', async () => {
+      initializeWebMCPPolyfill();
+      const resources = navigator.modelContext.resources;
+      if (!resources) throw new Error('resources unavailable');
+
+      const seen: string[] = [];
+      resources.addEventListener('resourcechange', () => {
+        seen.push('event');
+      });
+      const onhandler = vi.fn();
+      resources.onresourcechange = onhandler;
+
+      resources.register('ui://evt/one', async () => ({ text: 'x', mimeType: 'text/plain' }));
+      resources.register('ui://evt/two', async () => ({ text: 'y', mimeType: 'text/plain' }));
+      resources.unregister('ui://evt/one');
+      // Unregistering an unknown URI should NOT fire the event.
+      resources.unregister('ui://evt/never');
+
+      await new Promise<void>((r) => queueMicrotask(() => queueMicrotask(r)));
+
+      expect(seen.length).toBeGreaterThanOrEqual(3);
+      expect(onhandler).toHaveBeenCalled();
+    });
+
+    it('tool _meta survives the testing-shim listTools boundary', () => {
+      initializeWebMCPPolyfill();
+
+      // `_meta` is intentionally not part of the public `ToolDescriptor`
+      // surface yet — we forward it through the polyfill via property spread,
+      // so register the tool through a generic helper that bypasses the
+      // strict overload signature.
+      const registerTool = navigator.modelContext.registerTool.bind(
+        navigator.modelContext
+      ) as unknown as (tool: Record<string, unknown>) => void;
+      registerTool({
+        name: 'widget_tool',
+        description: 'Tool with _meta.ui',
+        inputSchema: { type: 'object', properties: {} },
+        execute: async () => ({ content: [] }),
+        _meta: { ui: { resourceUri: 'ui://test/widget.html' } },
+      });
+
+      const infos = navigator.modelContextTesting?.listTools() ?? [];
+      const widget = infos.find((t) => t.name === 'widget_tool');
+      expect(widget).toBeDefined();
+      expect(widget?._meta).toEqual({ ui: { resourceUri: 'ui://test/widget.html' } });
+    });
+  });
 });

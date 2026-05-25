@@ -37,6 +37,13 @@ export interface ModelContextTestingToolInfo {
   name: string;
   description: string;
   inputSchema?: string;
+  /**
+   * Tool-level `_meta` block forwarded verbatim. Native Chromium doesn't
+   * surface this yet, but the polyfill exposes it so the relay's embed bridge
+   * can preserve `_meta.ui.resourceUri` (MCP Apps Phase 3) across the
+   * postMessage / WebSocket boundary.
+   */
+  _meta?: Record<string, unknown>;
 }
 
 /**
@@ -210,6 +217,128 @@ export interface ModelContextRegisterToolOptions {
 // Model Context
 // ============================================================================
 
+// ============================================================================
+// Resources (MCP Apps Phase 2)
+// ============================================================================
+
+/**
+ * Result payload returned by a resource provider function.
+ *
+ * Either `text` or `blob` (base64-encoded) MUST be supplied. `mimeType` is
+ * required so the host can correctly render or decode the payload. `meta` is
+ * surfaced verbatim on the wire as the per-content `_meta` block per the MCP
+ * spec stable 2026-01-26.
+ */
+export interface ResourceProviderResult {
+  /**
+   * UTF-8 text payload. Mutually exclusive with `blob`.
+   */
+  text?: string;
+
+  /**
+   * Base64-encoded binary payload. Mutually exclusive with `text`.
+   */
+  blob?: string;
+
+  /**
+   * MIME type of the payload (e.g. `text/html;profile=mcp-app`).
+   */
+  mimeType: string;
+
+  /**
+   * Per-content `_meta` block forwarded verbatim to MCP clients.
+   */
+  meta?: Record<string, unknown>;
+}
+
+/**
+ * Function invoked when an MCP client requests the resource identified by `uri`.
+ *
+ * The function MUST resolve with a {@link ResourceProviderResult} carrying
+ * either `text` or `blob`. Synchronous returns are permitted via Promise.resolve.
+ */
+export type ResourceProvider = () => Promise<ResourceProviderResult> | ResourceProviderResult;
+
+/**
+ * Optional descriptor fields advertised for a registered resource.
+ *
+ * Mirrors the MCP `Resource` shape used by `resources/list`. Hosts treat
+ * arbitrary additional properties (including `_meta.ui.*`) opaquely.
+ */
+export interface ResourceRegisterOptions {
+  /**
+   * Human-readable resource name. Defaults to the URI when omitted.
+   */
+  name?: string;
+
+  /**
+   * Optional UI title.
+   */
+  title?: string;
+
+  /**
+   * Optional human-readable description.
+   */
+  description?: string;
+
+  /**
+   * Optional declared MIME type. Hosts may use this for `resources/list`
+   * even if the provider later returns a different type at read time.
+   */
+  mimeType?: string;
+
+  /**
+   * Per-resource `_meta` forwarded verbatim. Use this for MCP Apps fields
+   * such as `_meta.ui.*` (per spec stable 2026-01-26).
+   */
+  _meta?: Record<string, unknown>;
+}
+
+/**
+ * `navigator.modelContext.resources` namespace.
+ *
+ * Sibling to the tools surface. Independently registers `ui://` (or any other
+ * scheme) resources whose payloads are produced on demand by a JavaScript
+ * provider. The polyfill plumbs registrations to the local relay so MCP clients
+ * can discover them via `resources/list` and fetch them via `resources/read`.
+ */
+export interface ModelContextResources extends EventTarget {
+  /**
+   * Registers a resource identified by `uri` with the provided callback.
+   *
+   * Re-registering an existing URI replaces the previous provider.
+   *
+   * @param uri Canonical resource URI (e.g. `ui://my-app/widget.html`).
+   * @param provider Function invoked to produce the resource payload on read.
+   * @param options Optional resource descriptor (name, description, _meta, ...).
+   */
+  register(uri: string, provider: ResourceProvider, options?: ResourceRegisterOptions): void;
+
+  /**
+   * Unregisters a previously-registered resource. No-ops if the URI is unknown.
+   */
+  unregister(uri: string): void;
+
+  /**
+   * Handler invoked when the registered resource list changes.
+   */
+  onresourcechange: ((this: ModelContextResources, ev: Event) => unknown) | null;
+
+  addEventListener(
+    type: 'resourcechange',
+    listener: () => void,
+    options?: boolean | AddEventListenerOptions
+  ): void;
+
+  removeEventListener(
+    type: 'resourcechange',
+    listener: () => void,
+    options?: boolean | EventListenerOptions
+  ): void;
+
+  dispatchEvent(event: Event): boolean;
+}
+
 /**
  * Strict WebMCP core interface on navigator.modelContext.
  */
@@ -309,6 +438,16 @@ export interface ModelContextCore {
    * @deprecated Removed from the upstream WebMCP spec on March 5, 2026. Kept only as a temporary compatibility API.
    */
   clearContext(): void;
+
+  /**
+   * Resources namespace exposing `register` / `unregister` for MCP `ui://`
+   * (and other) resources. Non-standard: this is an MCP Apps extension shipped
+   * by the polyfill ahead of native runtime support. May be `undefined` on
+   * runtimes that don't implement the MCP Apps phase 2 surface.
+   *
+   * @see https://github.com/modelcontextprotocol/ext-apps/blob/main/specification/2026-01-26/apps.mdx
+   */
+  resources?: ModelContextResources;
 }
 
 /**

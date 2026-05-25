@@ -35,6 +35,7 @@ interface HostMessage {
   requestId: string;
   type: string;
   tools?: unknown;
+  resources?: unknown;
   result?: unknown;
   error?: unknown;
 }
@@ -176,6 +177,7 @@ export function parseHostMessage(value: unknown): HostMessage | null {
     requestId: value.requestId as string,
     type: value.type as string,
     tools: value.tools,
+    resources: value.resources,
     result: value.result,
     error: value.error,
   };
@@ -483,6 +485,24 @@ export function runWidget(cfg: WidgetConfig): void {
 
     const sendInitialTools = (): void => {
       safeSend(socket, JSON.stringify({ type: 'tools/list', tools: initialTools }));
+      // After tools (and only after `hello/accepted` since this function is
+      // gated on that path), pull the initial resources snapshot from the host
+      // page. Resources are an MCP Apps extension and the host may not have
+      // any registered, in which case we send an empty array — matching the
+      // tools/list shape.
+      requestHost('webmcp.resources.list', {})
+        .then((message) => {
+          if (activeSocket !== socket || socket.readyState !== WebSocket.OPEN) return;
+          const resources = Array.isArray(message.resources) ? message.resources : [];
+          safeSend(socket, JSON.stringify({ type: 'resources/list', resources }));
+        })
+        .catch((error) => {
+          console.warn('[webmcp-relay-widget] Initial resources/list fetch failed:', error);
+          // Best-effort empty snapshot so the relay has a consistent view.
+          if (activeSocket === socket && socket.readyState === WebSocket.OPEN) {
+            safeSend(socket, JSON.stringify({ type: 'resources/list', resources: [] }));
+          }
+        });
     };
 
     if (scheduledReconnect) {
@@ -579,6 +599,56 @@ export function runWidget(cfg: WidgetConfig): void {
           },
           cfg.hostOrigin
         );
+        return;
+      }
+
+      // MCP Apps Phase 2: relay forwards `resources/read` to the browser as
+      // `read-resource`. Round-trip through embed.ts → polyfill provider →
+      // ReadResourceResult and send back as `resource-result` with the same
+      // callId. Failures are reported via `resource-result` with an error
+      // result rather than a separate error message type, mirroring the tool
+      // invocation contract.
+      if (relayMessage.type === 'read-resource') {
+        const callId = relayMessage.callId;
+        const uri = relayMessage.uri;
+        if (typeof callId !== 'string' || typeof uri !== 'string') {
+          console.warn('[webmcp-relay-widget] read-resource missing callId/uri:', relayMessage);
+          return;
+        }
+        requestHost('webmcp.resources.read', { uri })
+          .then((hostResponse) => {
+            safeSend(
+              socket,
+              JSON.stringify({
+                type: 'resource-result',
+                callId,
+                result: hostResponse.result,
+              })
+            );
+          })
+          .catch((error: unknown) => {
+            safeSend(
+              socket,
+              JSON.stringify({
+                type: 'resource-result',
+                callId,
+                // The relay validates `result` against ReadResourceResultSchema
+                // and will surface a clean JSON-RPC error to the MCP client when
+                // validation fails. We send an explicit shape with a text
+                // content block so logs still capture the underlying error.
+                result: {
+                  contents: [
+                    {
+                      uri,
+                      mimeType: 'text/plain',
+                      text: `Resource read failed: ${String(error instanceof Error ? error.message : error)}`,
+                    },
+                  ],
+                  _meta: { error: true },
+                },
+              })
+            );
+          });
         return;
       }
 
@@ -802,6 +872,22 @@ export function runWidget(cfg: WidgetConfig): void {
           JSON.stringify({
             type: 'tools/changed',
             tools: Array.isArray(data.tools) ? data.tools : [],
+          })
+        );
+      }
+      return;
+    }
+
+    if (isJsonObject(data) && data.type === 'webmcp.resources.changed') {
+      // Relay's hello-gate drops `resources/changed` from connections without
+      // an accepted hello. We mirror that here by only forwarding once
+      // hello/accepted has fired (matching the tools/changed gate above).
+      if (activeSocket && helloAccepted) {
+        safeSend(
+          activeSocket,
+          JSON.stringify({
+            type: 'resources/changed',
+            resources: Array.isArray(data.resources) ? data.resources : [],
           })
         );
       }

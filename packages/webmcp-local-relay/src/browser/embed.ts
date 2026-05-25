@@ -32,6 +32,13 @@ interface RelayToolDescriptor {
   name: string;
   description?: string;
   inputSchema?: JsonObject;
+  /**
+   * Tool-level `_meta` block forwarded verbatim to the relay (and onwards to
+   * the MCP client). MCP Apps uses `_meta.ui.resourceUri` here to attach a
+   * `ui://` widget to a tool result. The polyfill's testing-shim listTools()
+   * surface emits this; native Chromium has not adopted it yet.
+   */
+  _meta?: JsonObject;
 }
 
 interface ToolBridge {
@@ -39,11 +46,68 @@ interface ToolBridge {
   invoke: (name: string, args: JsonObject) => unknown;
 }
 
+/**
+ * Resource descriptor sent to the relay widget (and onwards over WebSocket).
+ *
+ * Mirrors the relay's `BrowserResourceDescriptorSchema` (looseObject): only
+ * `uri` and `name` are required; the rest pass through verbatim.
+ */
+interface RelayResourceDescriptor {
+  uri: string;
+  name: string;
+  title?: string;
+  description?: string;
+  mimeType?: string;
+  _meta?: JsonObject;
+}
+
+/**
+ * MCP `ReadResourceResult` payload returned by the host page's resource
+ * provider. The relay validates this against the SDK schema before forwarding
+ * to the MCP client, so the bridge intentionally types the shape loosely.
+ */
+interface RelayReadResourceResult {
+  contents: Array<{
+    uri: string;
+    mimeType?: string;
+    text?: string;
+    blob?: string;
+    _meta?: JsonObject;
+  }>;
+  _meta?: JsonObject;
+}
+
+interface ResourcesBridge {
+  list: () => RelayResourceDescriptor[];
+  read: (uri: string) => Promise<RelayReadResourceResult>;
+}
+
+/**
+ * Polyfill-only shape duck-typed at runtime to detect `navigator.modelContext.resources`.
+ *
+ * We declare an internal-only interface here (rather than importing the new
+ * `ModelContextResources` type) so this script keeps compiling against older
+ * `@mcp-b/webmcp-types` releases that don't yet expose `resources` on
+ * `Navigator.modelContext`.
+ */
+interface PolyfillResourcesSurface {
+  register(uri: string, provider: () => unknown, options?: unknown): void;
+  unregister(uri: string): void;
+  list?: () => RelayResourceDescriptor[];
+  read?: (uri: string) => Promise<RelayReadResourceResult>;
+  addEventListener(
+    type: 'resourcechange',
+    listener: () => void,
+    options?: boolean | AddEventListenerOptions
+  ): void;
+}
+
 interface WidgetRequestMessage {
   requestId: string;
   type: string;
   toolName?: unknown;
   args?: unknown;
+  uri?: unknown;
 }
 
 interface RelayConfig {
@@ -161,19 +225,33 @@ function toInvokeArgs(value: unknown): JsonObject {
 }
 
 function mapToolListItem(tool: ToolListItem): RelayToolDescriptor {
-  return {
+  const out: RelayToolDescriptor = {
     name: tool.name,
     description: tool.description,
     inputSchema: tool.inputSchema,
   };
+  // Boundary preservation: forward tool-level `_meta` so the relay can
+  // surface `_meta.ui.resourceUri` (MCP Apps Phase 3). The relay's own
+  // `normalizeInboundTool` currently strips additional fields — note this in
+  // the embed-side patch so Phase 3 knows to extend the relay normalizer too.
+  const meta = (tool as ToolListItem & { _meta?: unknown })._meta;
+  if (isJsonObject(meta)) {
+    out._meta = meta;
+  }
+  return out;
 }
 
 function mapTestingToolInfo(tool: ModelContextTestingToolInfo): RelayToolDescriptor {
-  return {
+  const out: RelayToolDescriptor = {
     name: tool.name,
     description: tool.description,
     inputSchema: parseTestingSchema(tool.inputSchema),
   };
+  const meta = (tool as ModelContextTestingToolInfo & { _meta?: unknown })._meta;
+  if (isJsonObject(meta)) {
+    out._meta = meta;
+  }
+  return out;
 }
 
 /**
@@ -245,7 +323,48 @@ function getToolBridge(): ToolBridge | null {
   return null;
 }
 
+function getResourcesSurface(): PolyfillResourcesSurface | null {
+  const mc = navigator.modelContext as unknown as {
+    resources?: PolyfillResourcesSurface;
+  } | null;
+  if (!mc) return null;
+  const candidate = mc.resources;
+  if (
+    candidate &&
+    typeof candidate === 'object' &&
+    typeof candidate.register === 'function' &&
+    typeof candidate.unregister === 'function' &&
+    typeof candidate.list === 'function' &&
+    typeof candidate.read === 'function' &&
+    typeof candidate.addEventListener === 'function'
+  ) {
+    return candidate;
+  }
+  return null;
+}
+
+function getResourcesBridge(): ResourcesBridge | null {
+  const surface = getResourcesSurface();
+  if (!surface || !surface.list || !surface.read) return null;
+  return {
+    list() {
+      const raw = surface.list?.() ?? [];
+      // Only forward entries that have `uri` and `name` strings — the relay's
+      // schema requires both as non-empty strings. Drop malformed entries
+      // silently to match the spirit of the existing tool mapping helpers.
+      return raw.filter(
+        (r): r is RelayResourceDescriptor =>
+          isJsonObject(r) && typeof r.uri === 'string' && typeof r.name === 'string'
+      );
+    },
+    read(uri: string) {
+      return Promise.resolve(surface.read?.(uri) as Promise<RelayReadResourceResult>);
+    },
+  };
+}
+
 let pushScheduled = false;
+let pushResourcesScheduled = false;
 
 function onToolsChanged(): void {
   if (pushScheduled || !widgetWindow) return;
@@ -270,6 +389,65 @@ function onToolsChanged(): void {
         debugWarn('Failed to push tool changes:', err);
       });
   }, 0);
+}
+
+function onResourcesChanged(): void {
+  if (pushResourcesScheduled || !widgetWindow) return;
+  pushResourcesScheduled = true;
+  setTimeout(() => {
+    pushResourcesScheduled = false;
+    if (!widgetWindow) return;
+    const bridge = getResourcesBridge();
+    const resources = bridge ? bridge.list() : [];
+    widgetWindow.postMessage(
+      {
+        type: 'webmcp.resources.changed',
+        resources,
+      },
+      config.widgetOrigin
+    );
+  }, 0);
+}
+
+function trySubscribeResources(): boolean {
+  const surface = getResourcesSurface();
+  if (!surface) return false;
+  try {
+    surface.addEventListener('resourcechange', onResourcesChanged);
+    return true;
+  } catch (error) {
+    debugWarn('resources.addEventListener threw:', error);
+    return false;
+  }
+}
+
+function subscribeToResourcesChanges(): void {
+  if (trySubscribeResources()) {
+    return;
+  }
+  // The polyfill installs the resources namespace synchronously during
+  // `initializeWebMCPPolyfill`, but native Chromium may install it later.
+  // Use the same retry cadence as tool subscriptions to stay forgiving.
+  let retries = 0;
+  let retryDelayMs = 100;
+  const MAX_RETRIES = 40;
+  const MAX_RETRY_DELAY_MS = 1000;
+
+  const scheduleRetry = (): void => {
+    setTimeout(() => {
+      retries++;
+      if (trySubscribeResources()) return;
+      if (retries >= MAX_RETRIES) {
+        debugWarn(
+          `Could not subscribe to resourcechange after ${MAX_RETRIES} retries. Dynamic resource updates will not be relayed.`
+        );
+        return;
+      }
+      retryDelayMs = Math.min(Math.round(retryDelayMs * 1.5), MAX_RETRY_DELAY_MS);
+      scheduleRetry();
+    }, retryDelayMs);
+  };
+  scheduleRetry();
 }
 
 function trySubscribe(): boolean {
@@ -354,7 +532,59 @@ function parseWidgetRequest(value: unknown): WidgetRequestMessage | null {
     type: value.type,
     toolName: value.toolName,
     args: value.args,
+    uri: value.uri,
   };
+}
+
+function handleResourcesListRequest(request: WidgetRequestMessage, event: MessageEvent): void {
+  const bridge = getResourcesBridge();
+  const resources = bridge ? bridge.list() : [];
+  respondToSource(event.source, event.origin, {
+    type: 'webmcp.resources.list.response',
+    requestId: request.requestId,
+    resources,
+  });
+}
+
+function handleResourcesReadRequest(request: WidgetRequestMessage, event: MessageEvent): void {
+  const bridge = getResourcesBridge();
+  const uri = typeof request.uri === 'string' ? request.uri : '';
+  if (!bridge) {
+    respondToSource(event.source, event.origin, {
+      type: 'webmcp.resources.read.error',
+      requestId: request.requestId,
+      error: 'No WebMCP resources runtime found on this page',
+    });
+    return;
+  }
+  if (uri.length === 0) {
+    respondToSource(event.source, event.origin, {
+      type: 'webmcp.resources.read.error',
+      requestId: request.requestId,
+      error: 'Resource read request is missing a uri',
+    });
+    return;
+  }
+
+  Promise.resolve()
+    .then(() => bridge.read(uri))
+    .then((result) => {
+      respondToSource(event.source, event.origin, {
+        type: 'webmcp.resources.read.response',
+        requestId: request.requestId,
+        // The bridge already returns the MCP `ReadResourceResult` shape
+        // (`{contents: [...], _meta?}`). The widget forwards `result` verbatim
+        // over the WebSocket; the relay validates it server-side.
+        result,
+      });
+    })
+    .catch((error: unknown) => {
+      respondToSource(event.source, event.origin, {
+        type: 'webmcp.resources.read.error',
+        requestId: request.requestId,
+        error: String(error instanceof Error ? error.message : error),
+      });
+    });
 }
 
 function handleListRequest(request: WidgetRequestMessage, event: MessageEvent): void {
@@ -604,6 +834,16 @@ if (!document.querySelector(RELAY_IFRAME_SELECTOR)) {
 
     if (request.type === 'webmcp.tools.invoke.request') {
       handleInvokeRequest(request, event);
+      return;
+    }
+
+    if (request.type === 'webmcp.resources.list.request') {
+      handleResourcesListRequest(request, event);
+      return;
+    }
+
+    if (request.type === 'webmcp.resources.read.request') {
+      handleResourcesReadRequest(request, event);
     }
   });
 
@@ -619,4 +859,5 @@ if (!document.querySelector(RELAY_IFRAME_SELECTOR)) {
   }
 
   subscribeToToolChanges();
+  subscribeToResourcesChanges();
 }

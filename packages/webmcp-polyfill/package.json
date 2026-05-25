@@ -64,12 +64,15 @@
     "@standard-schema/spec": "^1.1.0"
   },
   "devDependencies": {
+    "@modelcontextprotocol/sdk": "catalog:",
+    "@types/ws": "^8.5.13",
     "@vitest/coverage-v8": "catalog:",
     "happy-dom": "^20.8.9",
     "playwright": "catalog:",
     "typescript": "catalog:",
     "vite-plus": "catalog:",
-    "vitest": "catalog:"
+    "vitest": "catalog:",
+    "ws": "^8.18.0"
   },
   "engines": {
     "node": ">=18"

@@ -6,10 +6,14 @@ import type {
   ModelContextClient,
   ModelContextOptions,
   ModelContextRegisterToolOptions,
+  ModelContextResources,
   ModelContextTesting,
   ModelContextTestingExecuteToolOptions,
   ModelContextTestingToolInfo,
   ModelContextToolReference,
+  ResourceProvider,
+  ResourceProviderResult,
+  ResourceRegisterOptions,
   ToolDescriptor,
   ToolResponse,
 } from '@mcp-b/webmcp-types';
@@ -107,13 +111,54 @@ export interface WebMCPPolyfillInitOptions {
   disableIframeTransportByDefault?: boolean;
 }
 
+/**
+ * In-memory registration entry for a resource provider.
+ *
+ * The polyfill keeps the descriptor pulled from {@link ResourceRegisterOptions}
+ * (so `resources/list` over the WS bridge returns a stable shape) and the
+ * provider callback invoked on `resources/read`. Registrations are lost on
+ * page reload — by design, per the design doc (no `localStorage`).
+ */
+interface PolyfillResourceEntry {
+  uri: string;
+  name: string;
+  title?: string;
+  description?: string;
+  mimeType?: string;
+  _meta?: Record<string, unknown>;
+  provider: ResourceProvider;
+}
+
+/**
+ * Public descriptor shape forwarded over `postMessage` / WebSocket. Matches
+ * the relay's `BrowserResourceDescriptorSchema` (passthrough additional fields).
+ */
+interface PolyfillResourceDescriptor {
+  uri: string;
+  name: string;
+  title?: string;
+  description?: string;
+  mimeType?: string;
+  _meta?: Record<string, unknown>;
+}
+
 class StrictWebMCPContext extends EventTarget {
   private tools = new Map<string, PolyfillToolDescriptor>();
+  private resources: PolyfillResourcesNamespace;
   private testingShim: PolyfillTestingShim | null = null;
   private _ontoolchange: ((this: ModelContext, ev: Event) => unknown) | null = null;
   private provideContextDeprecationWarned = false;
   private clearContextDeprecationWarned = false;
   private unregisterToolDeprecationWarned = false;
+
+  constructor() {
+    super();
+    this.resources = new PolyfillResourcesNamespace();
+  }
+
+  getResources(): PolyfillResourcesNamespace {
+    return this.resources;
+  }
 
   get ontoolchange(): ((this: ModelContext, ev: Event) => unknown) | null {
     return this._ontoolchange;
@@ -203,7 +248,21 @@ class StrictWebMCPContext extends EventTarget {
       } catch {
         inputSchema = '{"type":"object"}';
       }
-      return { name: tool.name, description: tool.description, inputSchema };
+      // Boundary preservation (MCP Apps Phase 3): forward tool-level `_meta`
+      // so the relay's embed bridge can surface `_meta.ui.resourceUri`.
+      // The native Chromium `ModelContextTesting.listTools()` does NOT yet
+      // emit `_meta`; this is a polyfill-only extension and is typed via
+      // `ModelContextTestingToolInfo._meta`.
+      const meta = (tool as unknown as { _meta?: unknown })._meta;
+      const info: ModelContextTestingToolInfo = {
+        name: tool.name,
+        description: tool.description,
+        inputSchema,
+      };
+      if (isPlainObject(meta)) {
+        info._meta = meta;
+      }
+      return info;
     });
   }
 
@@ -371,6 +430,194 @@ class PolyfillTestingShim extends EventTarget implements ModelContextTesting {
     this.dispatchEvent(event);
     // Deprecated compat: fire old event name so existing listeners keep working
     this.dispatchEvent(new Event('toolschanged'));
+  }
+}
+
+/**
+ * `navigator.modelContext.resources` namespace implementation.
+ *
+ * Registry of `ui://` (or other) MCP resources whose payloads are produced
+ * on demand by a JavaScript provider. The bridge layer (`embed.ts` in the
+ * local-relay package) drains the registry on `resources/list` and invokes
+ * a provider when a `read-resource` arrives over the WebSocket.
+ *
+ * Registrations live in-memory only — they are intentionally NOT persisted
+ * to `localStorage` (per Phase 2 design doc). The host page is responsible
+ * for re-registering after navigation / reload.
+ *
+ * EventTarget surface: dispatches a `resourcechange` event whenever the
+ * registered URI set changes. The embed layer listens for this and pushes
+ * a `resources/changed` snapshot over the WebSocket.
+ */
+class PolyfillResourcesNamespace extends EventTarget implements ModelContextResources {
+  private readonly entries = new Map<string, PolyfillResourceEntry>();
+  private _onresourcechange: ((this: ModelContextResources, ev: Event) => unknown) | null = null;
+
+  register(uri: string, provider: ResourceProvider, options?: ResourceRegisterOptions): void {
+    if (typeof uri !== 'string' || uri.length === 0) {
+      throw new TypeError(
+        "Failed to execute 'register' on 'ModelContextResources': uri must be a non-empty string."
+      );
+    }
+
+    if (typeof provider !== 'function') {
+      throw new TypeError(
+        "Failed to execute 'register' on 'ModelContextResources': provider must be a function."
+      );
+    }
+
+    const opts = options ?? {};
+    if (opts !== undefined && opts !== null && typeof opts !== 'object') {
+      throw new TypeError(
+        "Failed to execute 'register' on 'ModelContextResources': options must be an object."
+      );
+    }
+
+    const entry: PolyfillResourceEntry = {
+      uri,
+      // Per MCP `Resource` shape, `name` is required. Default to the URI for
+      // ergonomic single-arg registrations.
+      name: typeof opts.name === 'string' && opts.name.length > 0 ? opts.name : uri,
+      provider,
+    };
+    if (typeof opts.title === 'string') entry.title = opts.title;
+    if (typeof opts.description === 'string') entry.description = opts.description;
+    if (typeof opts.mimeType === 'string') entry.mimeType = opts.mimeType;
+    if (isPlainObject(opts._meta)) entry._meta = opts._meta;
+
+    this.entries.set(uri, entry);
+    this.notifyResourcesChanged();
+  }
+
+  unregister(uri: string): void {
+    if (typeof uri !== 'string') {
+      throw new TypeError(
+        "Failed to execute 'unregister' on 'ModelContextResources': uri must be a string."
+      );
+    }
+    const removed = this.entries.delete(uri);
+    if (removed) {
+      this.notifyResourcesChanged();
+    }
+  }
+
+  get onresourcechange(): ((this: ModelContextResources, ev: Event) => unknown) | null {
+    return this._onresourcechange;
+  }
+
+  set onresourcechange(
+    handler: ((this: ModelContextResources, ev: Event) => unknown) | null
+  ) {
+    this._onresourcechange = handler;
+  }
+
+  /** @internal Used by the relay embed bridge to drain the current snapshot. */
+  list(): PolyfillResourceDescriptor[] {
+    const out: PolyfillResourceDescriptor[] = [];
+    for (const entry of this.entries.values()) {
+      const desc: PolyfillResourceDescriptor = { uri: entry.uri, name: entry.name };
+      if (entry.title !== undefined) desc.title = entry.title;
+      if (entry.description !== undefined) desc.description = entry.description;
+      if (entry.mimeType !== undefined) desc.mimeType = entry.mimeType;
+      if (entry._meta !== undefined) desc._meta = entry._meta;
+      out.push(desc);
+    }
+    return out;
+  }
+
+  /**
+   * @internal Invoked by the relay embed bridge when a `read-resource` arrives.
+   *
+   * Calls the registered provider and wraps its return into the MCP
+   * `ReadResourceResult` shape:
+   *
+   * ```
+   * { contents: [{ uri, mimeType?, text? | blob?, _meta? }], _meta? }
+   * ```
+   *
+   * The relay validates this against `ReadResourceResultSchema.safeParse(...)`
+   * before forwarding to the MCP client.
+   */
+  async read(uri: string): Promise<{
+    contents: Array<{
+      uri: string;
+      mimeType?: string;
+      text?: string;
+      blob?: string;
+      _meta?: Record<string, unknown>;
+    }>;
+  }> {
+    const entry = this.entries.get(uri);
+    if (!entry) {
+      throw new Error(`Resource not registered: ${uri}`);
+    }
+
+    const raw = await Promise.resolve(entry.provider());
+    if (!isPlainObject(raw)) {
+      throw new TypeError(
+        `Resource provider for "${uri}" must return an object with { text? | blob?, mimeType }`
+      );
+    }
+
+    const result = raw as ResourceProviderResult;
+    const hasText = typeof result.text === 'string';
+    const hasBlob = typeof result.blob === 'string';
+    if (!hasText && !hasBlob) {
+      throw new TypeError(
+        `Resource provider for "${uri}" must return either "text" or "blob" (string)`
+      );
+    }
+    if (hasText && hasBlob) {
+      throw new TypeError(
+        `Resource provider for "${uri}" returned both "text" and "blob" — exactly one is required`
+      );
+    }
+    if (typeof result.mimeType !== 'string' || result.mimeType.length === 0) {
+      throw new TypeError(
+        `Resource provider for "${uri}" must return a non-empty "mimeType" string`
+      );
+    }
+
+    const content: {
+      uri: string;
+      mimeType?: string;
+      text?: string;
+      blob?: string;
+      _meta?: Record<string, unknown>;
+    } = { uri, mimeType: result.mimeType };
+
+    if (hasText && typeof result.text === 'string') {
+      content.text = result.text;
+    } else if (typeof result.blob === 'string') {
+      content.blob = result.blob;
+    }
+    if (isPlainObject(result.meta)) {
+      content._meta = result.meta;
+    }
+
+    return { contents: [content] };
+  }
+
+  /** @internal Used by tests / cleanup; mostly exists to keep tests deterministic. */
+  clear(): void {
+    if (this.entries.size === 0) return;
+    this.entries.clear();
+    this.notifyResourcesChanged();
+  }
+
+  private notifyResourcesChanged(): void {
+    queueMicrotask(() => {
+      const event = new Event('resourcechange');
+      try {
+        this._onresourcechange?.call(this, event);
+      } catch (error) {
+        console.warn(
+          '[WebMCPPolyfill] navigator.modelContext.resources.onresourcechange handler threw:',
+          error
+        );
+      }
+      this.dispatchEvent(event);
+    });
   }
 }
 
@@ -941,6 +1188,17 @@ export function initializeWebMCPPolyfill(options?: WebMCPPolyfillInitOptions): v
   const context = new StrictWebMCPContext();
   const modelContext = context as unknown as PolyfillModelContext;
   modelContext[POLYFILL_MARKER_PROPERTY] = true;
+
+  // Expose `resources` namespace as a non-writable own property on the
+  // modelContext instance. Defining it explicitly (rather than as a class
+  // getter) keeps it visible to `Object.keys()` / `in` checks performed by
+  // the embed bridge, and prevents accidental reassignment.
+  Object.defineProperty(modelContext, 'resources', {
+    configurable: true,
+    enumerable: true,
+    writable: false,
+    value: context.getResources(),
+  });
 
   installState.previousModelContextDescriptor = Object.getOwnPropertyDescriptor(
     nav,

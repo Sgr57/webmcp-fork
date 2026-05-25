@@ -237,4 +237,14 @@ export interface ToolListItem<TName extends string = string> {
    * Optional behavior hints for LLM planners.
    */
   annotations?: ToolAnnotations;
+
+  /**
+   * Tool-level `_meta` block. Forwarded verbatim to MCP clients per the
+   * MCP spec stable 2026-01-26. MCP Apps uses `_meta.ui.resourceUri` here
+   * to attach a `ui://` widget to a tool result.
+   *
+   * Treated opaquely by the polyfill and the relay client; transports SHOULD
+   * preserve this field across `tools/list` / `tools/changed` payloads.
+   */
+  _meta?: Record<string, unknown>;
 }
