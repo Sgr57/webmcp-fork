@@ -1881,4 +1881,449 @@ describe('RelayBridgeServer client mode', () => {
       await server.stop();
     }
   });
+
+  // ---------------------------------------------------------------------------
+  // Resources (MCP Apps Phase 1) — see bridgeServer.ts:518-602 for the public
+  // API surface and bridgeServer.ts:892-914 for the message handlers.
+  //
+  // These tests mirror the parallel tool-side coverage above:
+  //   - readResource happy path mirrors "forwards invoke -> result" (line 122)
+  //   - disconnect rejection mirrors "rejects pending invocations when the
+  //     socket disconnects" (line 345)
+  //   - cross-connection isolation mirrors "does not reject pending
+  //     invocations from a different connection ..." (line 837)
+  // ---------------------------------------------------------------------------
+
+  it('forwards readResource -> resource-result over websocket', async () => {
+    const bridge = new RelayBridgeServer({
+      host: '127.0.0.1',
+      port: 0,
+      allowedOrigins: ['*'],
+    });
+
+    try {
+      await bridge.start();
+
+      const ws = await connectAndRegister(bridge, {
+        tabId: 'tab-1',
+        url: 'https://example.com',
+        tools: [{ name: 'noop_tool' }],
+      });
+
+      ws.send(
+        JSON.stringify({
+          type: 'resources/list',
+          resources: [
+            {
+              uri: 'ui://widget/test.html',
+              name: 'Test Widget',
+              mimeType: 'text/html+skybridge',
+            },
+          ],
+        })
+      );
+
+      await waitFor(() => (bridge.listResources().length > 0 ? true : undefined));
+
+      ws.on('message', (raw) => {
+        const msg = JSON.parse(String(raw));
+        if (msg.type !== 'read-resource') return;
+        ws.send(
+          JSON.stringify({
+            type: 'resource-result',
+            callId: msg.callId,
+            result: {
+              contents: [
+                {
+                  uri: msg.uri,
+                  mimeType: 'text/html',
+                  text: '<html>ok</html>',
+                },
+              ],
+            },
+          })
+        );
+      });
+
+      const result = (await bridge.readResource('ui://widget/test.html')) as {
+        contents?: Array<{ uri?: string; text?: string }>;
+      };
+
+      expect(result.contents?.[0]?.uri).toBe('ui://widget/test.html');
+      expect(result.contents?.[0]?.text).toBe('<html>ok</html>');
+
+      ws.close();
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it('rejects pending readResource when the socket disconnects', async () => {
+    const bridge = new RelayBridgeServer({
+      host: '127.0.0.1',
+      port: 0,
+      allowedOrigins: ['*'],
+    });
+
+    try {
+      await bridge.start();
+
+      const ws = await connectAndRegister(bridge, {
+        tabId: 'tab-1',
+        url: 'https://example.com',
+        tools: [{ name: 'noop_tool' }],
+      });
+
+      ws.send(
+        JSON.stringify({
+          type: 'resources/list',
+          resources: [{ uri: 'ui://widget/hang.html', name: 'Hang' }],
+        })
+      );
+      await waitFor(() => (bridge.listResources().length > 0 ? true : undefined));
+
+      // Browser intentionally never replies — promise stays pending.
+      const readPromise = bridge.readResource('ui://widget/hang.html');
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      ws.close();
+
+      await expect(readPromise).rejects.toThrow(/disconnected during read/i);
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it('does not reject readResource from a different connection when one disconnects', async () => {
+    const bridge = new RelayBridgeServer({
+      host: '127.0.0.1',
+      port: 0,
+      allowedOrigins: ['*'],
+    });
+
+    try {
+      await bridge.start();
+
+      // Connect two browser sources, each advertising a distinct resource.
+      const ws1 = await connectAndRegister(bridge, {
+        tabId: 'tab-a',
+        url: 'https://a.example.com',
+        tools: [{ name: 'tool_a' }],
+      });
+      const ws2 = await connectAndRegister(bridge, {
+        tabId: 'tab-b',
+        url: 'https://b.example.com',
+        tools: [{ name: 'tool_b' }],
+      });
+
+      ws1.send(
+        JSON.stringify({
+          type: 'resources/list',
+          resources: [{ uri: 'ui://widget/a.html', name: 'A' }],
+        })
+      );
+      ws2.send(
+        JSON.stringify({
+          type: 'resources/list',
+          resources: [{ uri: 'ui://widget/b.html', name: 'B' }],
+        })
+      );
+
+      await waitFor(() => (bridge.listResources().length >= 2 ? true : undefined));
+
+      // ws1 replies after a short delay so we can disconnect ws2 mid-flight.
+      ws1.on('message', (raw) => {
+        const msg = JSON.parse(String(raw));
+        if (msg.type !== 'read-resource') return;
+        setTimeout(() => {
+          ws1.send(
+            JSON.stringify({
+              type: 'resource-result',
+              callId: msg.callId,
+              result: {
+                contents: [
+                  { uri: msg.uri, mimeType: 'text/plain', text: 'from-a' },
+                ],
+              },
+            })
+          );
+        }, 100);
+      });
+
+      const readPromise = bridge.readResource('ui://widget/a.html');
+
+      // Disconnect ws2 while ws1's read is pending.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      ws2.close();
+
+      const result = (await readPromise) as {
+        contents?: Array<{ text?: string }>;
+      };
+      expect(result.contents?.[0]?.text).toBe('from-a');
+
+      ws1.close();
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it('warns but does not crash on resource-result with unknown callId', async () => {
+    const bridge = new RelayBridgeServer({
+      host: '127.0.0.1',
+      port: 0,
+      allowedOrigins: ['*'],
+    });
+
+    try {
+      await bridge.start();
+
+      const ws = await connectAndRegister(bridge, {
+        tabId: 'tab-1',
+        url: 'https://example.com',
+        tools: [{ name: 'noop_tool' }],
+      });
+
+      // Send an unsolicited resource-result with an unknown callId.
+      ws.send(
+        JSON.stringify({
+          type: 'resource-result',
+          callId: 'never-issued',
+          result: {
+            contents: [{ uri: 'ui://x', mimeType: 'text/plain', text: 'x' }],
+          },
+        })
+      );
+
+      // The bridge should still accept a follow-up tools/list, proving it
+      // did not drop the connection or crash on the orphan result.
+      ws.send(
+        JSON.stringify({
+          type: 'tools/changed',
+          tools: [{ name: 'tool_after' }],
+        })
+      );
+
+      const after = await waitFor(() => {
+        const tools = bridge.registry.listTools();
+        return tools.find((t) => t.originalName === 'tool_after')?.name;
+      });
+      expect(after).toBeTruthy();
+
+      ws.close();
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it('replaces (not merges) cached resources on resources/changed', async () => {
+    const bridge = new RelayBridgeServer({
+      host: '127.0.0.1',
+      port: 0,
+      allowedOrigins: ['*'],
+    });
+
+    try {
+      await bridge.start();
+
+      const ws = await connectAndRegister(bridge, {
+        tabId: 'tab-1',
+        url: 'https://example.com',
+        tools: [{ name: 'noop_tool' }],
+      });
+
+      ws.send(
+        JSON.stringify({
+          type: 'resources/list',
+          resources: [
+            { uri: 'ui://widget/old.html', name: 'Old' },
+            { uri: 'ui://widget/shared.html', name: 'Shared' },
+          ],
+        })
+      );
+
+      await waitFor(() => (bridge.listResources().length === 2 ? true : undefined));
+
+      ws.send(
+        JSON.stringify({
+          type: 'resources/changed',
+          resources: [
+            { uri: 'ui://widget/new.html', name: 'New' },
+            { uri: 'ui://widget/shared.html', name: 'Shared' },
+          ],
+        })
+      );
+
+      // Wait until 'new.html' appears and 'old.html' disappears.
+      const finalUris = await waitFor(() => {
+        const uris = bridge.listResources().map((r) => r.uri);
+        const hasNew = uris.includes('ui://widget/new.html');
+        const hasOld = uris.includes('ui://widget/old.html');
+        return hasNew && !hasOld ? uris : undefined;
+      });
+
+      expect(finalUris.sort()).toEqual(
+        ['ui://widget/new.html', 'ui://widget/shared.html'].sort()
+      );
+
+      ws.close();
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it('emits resourcesChanged on disconnect only when the connection had resources', async () => {
+    const bridge = new RelayBridgeServer({
+      host: '127.0.0.1',
+      port: 0,
+      allowedOrigins: ['*'],
+    });
+
+    try {
+      await bridge.start();
+
+      // First connection registers resources, second never does.
+      const wsWithResources = await connectAndRegister(bridge, {
+        tabId: 'tab-a',
+        url: 'https://a.example.com',
+        tools: [{ name: 'tool_a' }],
+      });
+      wsWithResources.send(
+        JSON.stringify({
+          type: 'resources/list',
+          resources: [{ uri: 'ui://widget/a.html', name: 'A' }],
+        })
+      );
+      await waitFor(() =>
+        bridge.listResources().some((r) => r.uri === 'ui://widget/a.html') ? true : undefined
+      );
+
+      const wsWithoutResources = await connectAndRegister(bridge, {
+        tabId: 'tab-b',
+        url: 'https://b.example.com',
+        tools: [{ name: 'tool_b' }],
+      });
+      // Make sure tab-b actually registered (so the disconnect path runs)
+      await waitFor(() =>
+        bridge.registry.listSources().length >= 2 ? true : undefined
+      );
+
+      let resourcesChangedCount = 0;
+      bridge.on('resourcesChanged', () => {
+        resourcesChangedCount += 1;
+      });
+
+      // Disconnect the resource-free connection first — should NOT fire.
+      wsWithoutResources.close();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(resourcesChangedCount).toBe(0);
+
+      // Disconnect the resource-bearing connection — should fire once.
+      wsWithResources.close();
+      await waitFor(() => (resourcesChangedCount > 0 ? true : undefined));
+      expect(resourcesChangedCount).toBe(1);
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it('rejects pending resource reads when the bridge stops', async () => {
+    const bridge = new RelayBridgeServer({
+      host: '127.0.0.1',
+      port: 0,
+      allowedOrigins: ['*'],
+    });
+
+    await bridge.start();
+
+    const ws = await connectAndRegister(bridge, {
+      tabId: 'tab-1',
+      url: 'https://example.com',
+      tools: [{ name: 'noop_tool' }],
+    });
+
+    ws.send(
+      JSON.stringify({
+        type: 'resources/list',
+        resources: [{ uri: 'ui://widget/hang.html', name: 'Hang' }],
+      })
+    );
+    await waitFor(() => (bridge.listResources().length > 0 ? true : undefined));
+
+    // Browser never replies; we stop the bridge while the read is pending.
+    const readPromise = bridge.readResource('ui://widget/hang.html');
+
+    // stop() proactively rejects pending resource reads with the explicit
+    // "Relay server stopped before resource read completed" message
+    // (bridgeServer.ts:450). Note: it does NOT funnel through the
+    // disconnect-during-read path — stop() drains pendingResourceReads
+    // before the socket close handlers can fire.
+    const rejected = expect(readPromise).rejects.toThrow(
+      /Relay server stopped before resource read completed/i
+    );
+
+    await bridge.stop();
+    await rejected;
+    ws.close();
+  });
+
+  it('ignores resources/list received before hello', async () => {
+    const bridge = new RelayBridgeServer({
+      host: '127.0.0.1',
+      port: 0,
+      allowedOrigins: ['*'],
+    });
+
+    try {
+      await bridge.start();
+
+      // Open a raw socket and send resources/list WITHOUT sending hello first.
+      const ws = new WebSocket(`ws://127.0.0.1:${bridge.port}`);
+      await new Promise<void>((resolve, reject) => {
+        ws.once('open', () => resolve());
+        ws.once('error', reject);
+      });
+
+      ws.send(
+        JSON.stringify({
+          type: 'resources/list',
+          resources: [{ uri: 'ui://widget/leaked.html', name: 'Leaked' }],
+        })
+      );
+
+      // Give the bridge a moment to process the (rejected) message.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      // The pre-hello resource must NOT have populated the cache.
+      expect(bridge.listResources().some((r) => r.uri === 'ui://widget/leaked.html')).toBe(
+        false
+      );
+
+      // Now complete the handshake and confirm subsequent resources DO land.
+      ws.send(
+        JSON.stringify({
+          type: 'hello',
+          tabId: 'tab-1',
+          url: 'https://example.com',
+          origin: 'https://example.com',
+        })
+      );
+      ws.send(JSON.stringify({ type: 'tools/list', tools: [{ name: 'noop' }] }));
+      ws.send(
+        JSON.stringify({
+          type: 'resources/list',
+          resources: [{ uri: 'ui://widget/legit.html', name: 'Legit' }],
+        })
+      );
+
+      await waitFor(() =>
+        bridge.listResources().some((r) => r.uri === 'ui://widget/legit.html')
+          ? true
+          : undefined
+      );
+
+      ws.close();
+    } finally {
+      await bridge.stop();
+    }
+  });
 });

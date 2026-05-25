@@ -102,6 +102,16 @@ export class RelayRegistry {
   }
 
   /**
+   * Returns true when a source has completed the `hello` handshake.
+   *
+   * Used by callers that need to gate connection-scoped state (e.g. the
+   * resource cache) on the same pre-hello check applied to `tools/list`.
+   */
+  hasSource(connectionId: string): boolean {
+    return this.sourceByConnectionId.has(connectionId);
+  }
+
+  /**
    * Replaces the full tool set for a source connection.
    */
   registerTools(connectionId: string, tools: RelayTool[]): void {

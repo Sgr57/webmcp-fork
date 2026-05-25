@@ -76,7 +76,11 @@ export interface RelayResourceDescriptor {
 /**
  * In-flight `resources/read` request waiting for a browser `resource-result`
  * message. Indexed by `callId` in a map disjoint from `pendingInvocations`
- * to avoid namespace collisions between tool calls and resource reads.
+ * to keep result types disjoint (tool results are validated against
+ * `CallToolResultSchema`; resource results against `ReadResourceResultSchema`)
+ * and to keep the two lifecycles independent — e.g. so a resource read's
+ * timeout cannot accidentally cancel a tool invocation that happens to share
+ * a UUID.
  */
 interface PendingResourceRead {
   callId: string;
@@ -891,6 +895,18 @@ export class RelayBridgeServer extends EventEmitter {
 
       case 'resources/list':
       case 'resources/changed':
+        // Mirror the tools/list hello-gate (case above): refuse resource
+        // payloads from connections that have not completed the `hello`
+        // handshake. Without this, a misbehaving or pre-hello browser could
+        // populate the resource cache for a connection that has no
+        // RelaySource record, breaking the invariant that every cached
+        // resource has an identifiable owning source.
+        if (!this.registry.hasSource(connectionId)) {
+          process.stderr.write(
+            `[webmcp-local-relay] warn: connection ${connectionId} sent ${message.type} before hello, ignoring\n`
+          );
+          break;
+        }
         this.resourcesByConnectionId.set(
           connectionId,
           message.resources as RelayResourceDescriptor[]

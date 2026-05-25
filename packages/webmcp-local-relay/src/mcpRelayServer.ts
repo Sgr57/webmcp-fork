@@ -6,8 +6,8 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import {
   ListResourcesRequestSchema,
   ListToolsRequestSchema,
-  type ReadResourceResult,
   ReadResourceRequestSchema,
+  ReadResourceResultSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod/v4';
 
@@ -275,8 +275,20 @@ export class LocalRelayMcpServer {
 
     this.mcpServer.server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
       const { uri } = request.params;
-      const result = (await this.bridge.readResource(uri)) as ReadResourceResult;
-      return result;
+      // The bridge returns `unknown` because it does not interpret browser
+      // payloads. Validate against the SDK schema before handing the result
+      // to the MCP client so a malformed browser response is reported as a
+      // server error rather than silently propagated. Mirrors the
+      // normalizeCallToolResult validation on the tool side.
+      const raw = await this.bridge.readResource(uri);
+      const parsed = ReadResourceResultSchema.safeParse(raw);
+      if (!parsed.success) {
+        const preview = JSON.stringify(raw)?.slice(0, 500) ?? 'undefined';
+        throw new Error(
+          `Browser returned invalid ReadResourceResult for "${uri}": ${parsed.error.message}; payload: ${preview}`
+        );
+      }
+      return parsed.data;
     });
   }
 
