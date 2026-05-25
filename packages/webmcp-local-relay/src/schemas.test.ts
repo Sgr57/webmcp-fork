@@ -72,6 +72,43 @@ describe('normalizeInboundTool', () => {
     expect(normalized.annotations).toBeUndefined();
     expect(normalized.outputSchema).toBeUndefined();
   });
+
+  it('preserves tool-level _meta (e.g. _meta.ui.resourceUri) end-to-end', () => {
+    const normalized = normalizeInboundTool({
+      name: 'show_widget',
+      _meta: { ui: { resourceUri: 'ui://test' } },
+    });
+    expect(normalized._meta).toEqual({ ui: { resourceUri: 'ui://test' } });
+  });
+
+  it('produces no _meta field when inbound has none', () => {
+    const normalized = normalizeInboundTool({ name: 'no_meta' });
+    expect(Object.hasOwn(normalized, '_meta')).toBe(false);
+  });
+
+  it('silently strips non-object _meta (e.g. string)', () => {
+    const normalized = normalizeInboundTool({
+      name: 'meta_string',
+      _meta: 'not-an-object',
+    } as unknown as Parameters<typeof normalizeInboundTool>[0]);
+    expect(normalized._meta).toBeUndefined();
+  });
+
+  it('silently strips null _meta', () => {
+    const normalized = normalizeInboundTool({
+      name: 'meta_null',
+      _meta: null,
+    } as unknown as Parameters<typeof normalizeInboundTool>[0]);
+    expect(normalized._meta).toBeUndefined();
+  });
+
+  it('silently strips array _meta', () => {
+    const normalized = normalizeInboundTool({
+      name: 'meta_array',
+      _meta: ['not', 'an', 'object'],
+    } as unknown as Parameters<typeof normalizeInboundTool>[0]);
+    expect(normalized._meta).toBeUndefined();
+  });
 });
 
 describe('BrowserHelloMessageSchema', () => {

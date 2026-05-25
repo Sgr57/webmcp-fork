@@ -466,12 +466,15 @@ class PolyfillResourcesNamespace extends EventTarget implements ModelContextReso
       );
     }
 
-    const opts = options ?? {};
-    if (opts !== undefined && opts !== null && typeof opts !== 'object') {
+    // Validate `options` BEFORE coalescing so a non-object argument is
+    // rejected. After `options ?? {}`, the value is always an object and the
+    // narrow check would be unreachable.
+    if (options !== undefined && (options === null || typeof options !== 'object')) {
       throw new TypeError(
         "Failed to execute 'register' on 'ModelContextResources': options must be an object."
       );
     }
+    const opts = options ?? {};
 
     const entry: PolyfillResourceEntry = {
       uri,

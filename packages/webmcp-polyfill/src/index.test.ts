@@ -2541,6 +2541,22 @@ describe('@mcp-b/webmcp-polyfill', () => {
         // @ts-expect-error wrong type
         resources.register('ui://bad', 'not a function')
       ).toThrow();
+      expect(() =>
+        resources.register(
+          'ui://bad/options-string',
+          async () => ({ text: 'x', mimeType: 'text/plain' }),
+          // @ts-expect-error wrong type
+          'bad'
+        )
+      ).toThrow("options must be an object");
+      expect(() =>
+        resources.register(
+          'ui://bad/options-null',
+          async () => ({ text: 'x', mimeType: 'text/plain' }),
+          // @ts-expect-error wrong type
+          null
+        )
+      ).toThrow("options must be an object");
     });
 
     it('read() rejects when provider returns invalid payload', async () => {

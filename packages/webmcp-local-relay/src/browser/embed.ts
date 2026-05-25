@@ -231,9 +231,9 @@ function mapToolListItem(tool: ToolListItem): RelayToolDescriptor {
     inputSchema: tool.inputSchema,
   };
   // Boundary preservation: forward tool-level `_meta` so the relay can
-  // surface `_meta.ui.resourceUri` (MCP Apps Phase 3). The relay's own
-  // `normalizeInboundTool` currently strips additional fields — note this in
-  // the embed-side patch so Phase 3 knows to extend the relay normalizer too.
+  // surface `_meta.ui.resourceUri` (MCP Apps Phase 3). The relay-side
+  // `normalizeInboundTool` preserves `_meta` end-to-end so this field reaches
+  // the MCP client unchanged.
   const meta = (tool as ToolListItem & { _meta?: unknown })._meta;
   if (isJsonObject(meta)) {
     out._meta = meta;

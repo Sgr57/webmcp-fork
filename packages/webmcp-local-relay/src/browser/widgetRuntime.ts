@@ -627,6 +627,15 @@ export function runWidget(cfg: WidgetConfig): void {
             );
           })
           .catch((error: unknown) => {
+            // TODO(phase-3): replace with a dedicated `resource-error` WS message
+            // + JSON-RPC error response. Currently the error is encoded as a
+            // successful ReadResourceResult with _meta.error = true, which the
+            // SDK schema accepts but is not part of the MCP spec. An MCP client
+            // cannot reliably distinguish this from a successful read that
+            // happens to mention "error" in its content. A proper
+            // `resource-error` message type in
+            // packages/webmcp-local-relay/src/schemas.ts would let the relay
+            // surface a JSON-RPC error to the MCP client instead.
             safeSend(
               socket,
               JSON.stringify({

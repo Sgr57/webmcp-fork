@@ -86,6 +86,17 @@ export function normalizeInboundTool(inbound: z.infer<typeof InboundToolSchema>)
   if (annotationsParsed.success && annotationsParsed.data !== undefined) {
     normalizedCandidate.annotations = annotationsParsed.data;
   }
+  // Preserve `_meta` end-to-end so MCP clients can see fields like
+  // `_meta.ui.resourceUri` (MCP Apps rendering). Non-object `_meta` is
+  // silently stripped — lenient by design, symmetric with the polyfill side.
+  if (
+    inbound._meta !== undefined &&
+    inbound._meta !== null &&
+    typeof inbound._meta === 'object' &&
+    !Array.isArray(inbound._meta)
+  ) {
+    normalizedCandidate._meta = inbound._meta;
+  }
 
   const normalizedParsed = NormalizedToolSchema.safeParse(normalizedCandidate);
   if (normalizedParsed.success) {
