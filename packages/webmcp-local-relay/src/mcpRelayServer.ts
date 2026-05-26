@@ -43,7 +43,27 @@ interface PublicToolMetadata {
   inputSchema: Record<string, unknown>;
   outputSchema?: Record<string, unknown>;
   annotations?: unknown;
+  _meta?: Record<string, unknown>;
 }
+
+/**
+ * Tool exposure mode.
+ *
+ * - `direct` — relayed browser tools are advertised as top-level MCP tools
+ *   with their original metadata (including `_meta.ui.resourceUri`) intact.
+ *   The four `webmcp_*` wrapper tools are NOT registered.
+ * - `wrapped` — only the four `webmcp_*` wrappers are advertised. Browser
+ *   tools are reachable indirectly via `webmcp_call_tool`. Backward-compatible
+ *   with the upstream `mcp-b` behavior.
+ * - `both` — both modes coexist: top-level tools AND the four wrappers are
+ *   advertised. This is the safest default for clients that don't yet handle
+ *   MCP Apps `_meta.ui.resourceUri` widget rendering — those clients can
+ *   still call wrappers, while MCP Apps hosts (e.g. Claude Desktop Cowork)
+ *   see top-level tools and engage widget rendering.
+ *
+ * @see CLI flag `--expose-tools=direct|wrapped|both`
+ */
+export type ExposeToolsMode = 'direct' | 'wrapped' | 'both';
 
 /**
  * Base options shared by all {@link LocalRelayMcpServer} configurations.
@@ -57,6 +77,11 @@ interface LocalRelayMcpServerBaseOptions {
    * MCP server version reported during initialization.
    */
   serverVersion?: string;
+  /**
+   * How browser-relayed tools are advertised to MCP clients.
+   * @defaultValue `'both'`
+   */
+  exposeTools?: ExposeToolsMode;
 }
 
 /**
@@ -85,6 +110,7 @@ export class LocalRelayMcpServer {
   private readonly dynamicToolHandles = new Map<string, RegisteredToolHandle>();
   private readonly dynamicToolData = new Map<string, AggregatedTool>();
   private readonly dynamicToolSignature = new Map<string, string>();
+  private readonly exposeTools: ExposeToolsMode;
 
   private syncing = false;
   private syncRequested = false;
@@ -95,6 +121,7 @@ export class LocalRelayMcpServer {
    */
   constructor(options: LocalRelayMcpServerOptions = {}) {
     this.bridge = options.bridge ?? new RelayBridgeServer(options.bridgeOptions);
+    this.exposeTools = options.exposeTools ?? 'both';
 
     this.mcpServer = new McpServer(
       {
@@ -103,6 +130,12 @@ export class LocalRelayMcpServer {
       },
       {
         capabilities: {
+          // Declare tools support explicitly so the `tools/list` request
+          // handler can be registered even when no static `webmcp_*` tools
+          // are present (i.e. `--expose-tools=direct`). When at least one
+          // static tool is registered via `mcpServer.registerTool`, the SDK
+          // auto-injects the same capability, so this is a safe overlap.
+          tools: { listChanged: true },
           // Declare resources support so MCP clients route resources/list and
           // resources/read to the relay. Resource state is populated dynamically
           // from connected browser sources; an empty list is returned when none
@@ -147,7 +180,13 @@ export class LocalRelayMcpServer {
       }
     );
 
-    this.registerStaticTools();
+    // Static `webmcp_*` wrapper tools are only registered in `wrapped` or
+    // `both` modes. In `direct` mode, MCP clients see browser tools as
+    // top-level tools with `_meta.ui.resourceUri` intact (required for MCP
+    // Apps widget rendering), and the wrappers would only add noise.
+    if (this.exposeTools !== 'direct') {
+      this.registerStaticTools();
+    }
     this.overrideListToolsHandler();
     this.registerResourcesHandlers();
 
@@ -242,16 +281,43 @@ export class LocalRelayMcpServer {
    * for dynamic (relayed) tools while preserving static tools as-is.
    */
   private overrideListToolsHandler(): void {
+    // Touch internal SDK state so the SDK's `setToolRequestHandlers` is
+    // marked initialised. Without this, the *first* call to
+    // `mcpServer.registerTool` (which happens when a browser source connects
+    // in `direct` mode) would overwrite our custom `tools/list` handler with
+    // the SDK's default one — and the default one filters by
+    // `_registeredTools`, missing `_meta` projection nuances. Setting the
+    // private flag is a known SDK escape hatch; the SDK uses the same
+    // pattern internally.
+    (this.mcpServer as unknown as { _toolHandlersInitialized: boolean })._toolHandlersInitialized =
+      true;
+
     this.mcpServer.server.setRequestHandler(ListToolsRequestSchema, () => {
+      // Mode `wrapped` hides relayed browser tools — only the static wrappers
+      // (which the LLM can invoke via `webmcp_call_tool`) are surfaced.
+      const includeDynamic = this.exposeTools !== 'wrapped';
+      const dynamicTools: Array<Record<string, unknown>> = includeDynamic
+        ? Array.from(this.dynamicToolData.entries()).map(([name, tool]) => ({
+            name,
+            // Preserve title alongside name so MCP Apps clients can display the
+            // friendly label declared by the browser source.
+            ...(tool.title ? { title: tool.title } : {}),
+            description: this.dynamicToolDescription(tool),
+            inputSchema: tool.inputSchema,
+            ...(tool.outputSchema ? { outputSchema: tool.outputSchema } : {}),
+            ...(tool.annotations ? { annotations: tool.annotations } : {}),
+            // Preserve `_meta` end-to-end (Phase 2 fix continued). MCP Apps
+            // hosts read `_meta.ui.resourceUri` from the tool definition to
+            // discover the inline widget — without this projection the widget
+            // never mounts even when the resource is reachable via
+            // `resources/list`.
+            ...(tool._meta ? { _meta: tool._meta } : {}),
+          }))
+        : [];
+
       const tools: Array<Record<string, unknown>> = [
         ...Array.from(this.staticToolData.values()).map((tool) => ({ ...tool })),
-        ...Array.from(this.dynamicToolData.entries()).map(([name, tool]) => ({
-          name,
-          description: this.dynamicToolDescription(tool),
-          inputSchema: tool.inputSchema,
-          ...(tool.outputSchema ? { outputSchema: tool.outputSchema } : {}),
-          ...(tool.annotations ? { annotations: tool.annotations } : {}),
-        })),
+        ...dynamicTools,
       ].sort((left, right) => String(left.name).localeCompare(String(right.name)));
 
       return { tools };

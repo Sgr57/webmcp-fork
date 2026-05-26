@@ -1,3 +1,10 @@
+import type { ExposeToolsMode } from './mcpRelayServer.js';
+
+/**
+ * Valid values for `--expose-tools`.
+ */
+export const EXPOSE_TOOLS_MODES = ['direct', 'wrapped', 'both'] as const satisfies readonly ExposeToolsMode[];
+
 /**
  * Parsed CLI options for relay startup.
  */
@@ -9,6 +16,7 @@ export interface CliOptions {
   label?: string;
   workspace?: string;
   relayId?: string;
+  exposeTools: ExposeToolsMode;
 }
 
 /**
@@ -22,6 +30,13 @@ export function parseCliOptions(argv: string[]): CliOptions {
     // Permissive by default for zero-config local development — any browser page can connect.
     // Use --widget-origin to restrict to trusted origins on shared machines or in production.
     allowedOrigins: ['*'],
+    // Default to `both`: expose top-level relayed tools (so MCP Apps widget
+    // hosts like Claude Desktop Cowork can read `_meta.ui.resourceUri`) AND
+    // the four `webmcp_*` wrapper tools (so older clients without MCP Apps
+    // support still see something useful via `webmcp_list_tools` +
+    // `webmcp_call_tool`). Use `--expose-tools=direct` to drop the wrappers
+    // once you confirm all your clients render MCP Apps widgets natively.
+    exposeTools: 'both',
   };
 
   const readFlagValue = (flag: string, index: number): string => {
@@ -88,6 +103,18 @@ export function parseCliOptions(argv: string[]): CliOptions {
       continue;
     }
 
+    if (token === '--expose-tools') {
+      const raw = readFlagValue(token, i);
+      i += 1;
+      if (!isExposeToolsMode(raw)) {
+        throw new Error(
+          `Invalid --expose-tools value "${raw}". Expected one of: ${EXPOSE_TOOLS_MODES.join(', ')}.`
+        );
+      }
+      options.exposeTools = raw;
+      continue;
+    }
+
     if (token === '--help' || token === '-h') {
       printHelp();
       process.exit(0);
@@ -103,6 +130,10 @@ export function parseCliOptions(argv: string[]): CliOptions {
   }
 
   return options;
+}
+
+function isExposeToolsMode(value: string): value is ExposeToolsMode {
+  return (EXPOSE_TOOLS_MODES as readonly string[]).includes(value);
 }
 
 /**
@@ -125,6 +156,15 @@ export function printHelp(): void {
       '  --label                  Human-readable relay label reported during discovery',
       '  --workspace              Optional workspace name reported during discovery',
       '  --relay-id               Stable relay identifier reported during discovery',
+      '  --expose-tools           How browser tools are exposed to MCP clients:',
+      '                             direct   - browser tools as top-level MCP tools',
+      '                                        with _meta.ui.resourceUri intact (best',
+      '                                        for MCP Apps widget hosts).',
+      '                             wrapped  - only the four webmcp_* wrapper tools',
+      '                                        (upstream mcp-b behavior; backward compat',
+      '                                        for clients without MCP Apps support).',
+      '                             both     - default; both direct and wrapped tools',
+      '                                        coexist.',
       '  --help, -h               Show help',
       '',
     ].join('\n')

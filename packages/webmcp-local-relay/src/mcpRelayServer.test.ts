@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest';
 import WebSocket from 'ws';
 
 import { RelayBridgeServer } from './bridgeServer.js';
-import { LocalRelayMcpServer } from './mcpRelayServer.js';
+import { LocalRelayMcpServer, type ExposeToolsMode } from './mcpRelayServer.js';
 import {
   EMPTY_STATIC_TOOL_INPUT_SHAPE,
   publicInputSchemaFromZodShape,
@@ -62,7 +62,10 @@ function firstContentText(result: unknown): string {
 /**
  * Creates a running relay + in-memory MCP client pair.
  */
-async function createConnectedRelay(options?: { invokeTimeoutMs?: number }): Promise<{
+async function createConnectedRelay(options?: {
+  invokeTimeoutMs?: number;
+  exposeTools?: ExposeToolsMode;
+}): Promise<{
   relay: LocalRelayMcpServer;
   bridge: RelayBridgeServer;
   client: Client;
@@ -74,7 +77,10 @@ async function createConnectedRelay(options?: { invokeTimeoutMs?: number }): Pro
     allowedOrigins: ['*'],
     invokeTimeoutMs: options?.invokeTimeoutMs ?? 500,
   });
-  const relay = new LocalRelayMcpServer({ bridge });
+  const relay = new LocalRelayMcpServer({
+    bridge,
+    ...(options?.exposeTools ? { exposeTools: options.exposeTools } : {}),
+  });
   await relay.start();
 
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -1360,6 +1366,326 @@ describe('LocalRelayMcpServer', () => {
       expect(tool?.inputSchema).toEqual(finalSchema);
 
       ws.close();
+      await cleanup();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Phase 4.5: --expose-tools flag and MCP Apps `_meta.ui.resourceUri`
+  // projection. See mcpRelayServer.ts:overrideListToolsHandler. The upstream
+  // mcp-b wrapping pattern (4 `webmcp_*` wrappers) hides browser tools behind
+  // `webmcp_call_tool`, which prevents MCP Apps hosts from discovering the
+  // tool's `_meta.ui.resourceUri` and mounting widgets. The `direct` mode
+  // exposes browser tools as top-level MCP tools with `_meta` intact.
+  // ---------------------------------------------------------------------------
+
+  describe('--expose-tools modes', () => {
+    it('default `both` mode exposes wrappers AND top-level dynamic tools', async () => {
+      const { bridge, client, cleanup } = await createConnectedRelay();
+
+      const ws = await connectBrowser(bridge, {
+        tabId: 'tab-both',
+        url: 'https://example.com',
+        tools: [{ name: 'get_thing', description: 'Get a thing' }],
+      });
+
+      await waitFor(() => (bridge.registry.listTools().length > 0 ? true : undefined));
+      await waitFor(async () => {
+        const list = await client.listTools();
+        return list.tools.some((t) => t.name === 'get_thing') ? true : undefined;
+      });
+
+      const list = await client.listTools();
+      const names = new Set(list.tools.map((t) => t.name));
+      // Wrappers
+      expect(names.has('webmcp_call_tool')).toBe(true);
+      expect(names.has('webmcp_list_tools')).toBe(true);
+      expect(names.has('webmcp_list_sources')).toBe(true);
+      expect(names.has('webmcp_open_page')).toBe(true);
+      // Top-level dynamic tool
+      expect(names.has('get_thing')).toBe(true);
+
+      ws.close();
+      await cleanup();
+    });
+
+    it('`wrapped` mode hides dynamic tools — only the 4 wrappers are listed', async () => {
+      const { bridge, client, cleanup } = await createConnectedRelay({ exposeTools: 'wrapped' });
+
+      const ws = await connectBrowser(bridge, {
+        tabId: 'tab-wrapped',
+        url: 'https://example.com',
+        tools: [{ name: 'should_be_hidden', description: 'Not visible top-level' }],
+      });
+
+      await waitFor(() => (bridge.registry.listTools().length > 0 ? true : undefined));
+
+      // Wait one extra tick so any list_changed has propagated.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      const list = await client.listTools();
+      const names = new Set(list.tools.map((t) => t.name));
+      expect(list.tools).toHaveLength(4);
+      expect(names.has('webmcp_call_tool')).toBe(true);
+      expect(names.has('webmcp_list_tools')).toBe(true);
+      expect(names.has('webmcp_list_sources')).toBe(true);
+      expect(names.has('webmcp_open_page')).toBe(true);
+      expect(names.has('should_be_hidden')).toBe(false);
+
+      ws.close();
+      await cleanup();
+    });
+
+    it('`direct` mode hides wrappers — only relayed top-level tools are listed', async () => {
+      const { bridge, client, cleanup } = await createConnectedRelay({ exposeTools: 'direct' });
+
+      const ws = await connectBrowser(bridge, {
+        tabId: 'tab-direct',
+        url: 'https://example.com',
+        tools: [
+          {
+            name: 'get_product',
+            description: 'Get a product',
+            inputSchema: { type: 'object', properties: { id: { type: 'string' } } },
+            _meta: { ui: { resourceUri: 'ui://app/product.html' } },
+          },
+        ],
+      });
+
+      await waitFor(() => (bridge.registry.listTools().length > 0 ? true : undefined));
+      await waitFor(async () => {
+        const list = await client.listTools();
+        return list.tools.some((t) => t.name === 'get_product') ? true : undefined;
+      });
+
+      const list = await client.listTools();
+      const names = list.tools.map((t) => t.name);
+      // No wrappers
+      expect(names.includes('webmcp_call_tool')).toBe(false);
+      expect(names.includes('webmcp_list_tools')).toBe(false);
+      expect(names.includes('webmcp_list_sources')).toBe(false);
+      expect(names.includes('webmcp_open_page')).toBe(false);
+      // Direct top-level tool
+      expect(names).toContain('get_product');
+
+      ws.close();
+      await cleanup();
+    });
+
+    it('preserves `_meta.ui.resourceUri` on top-level dynamic tools (both mode)', async () => {
+      const { bridge, client, cleanup } = await createConnectedRelay();
+
+      const ws = await connectBrowser(bridge, {
+        tabId: 'tab-meta',
+        url: 'https://example.com',
+        tools: [
+          {
+            name: 'get_product',
+            description: 'Get a product',
+            inputSchema: { type: 'object', properties: { id: { type: 'string' } } },
+            _meta: {
+              ui: {
+                resourceUri: 'ui://bellaroma/product-card.html',
+                preferredFrameSize: ['480px', '640px'],
+              },
+              'mcp-apps/widget': 'product-card',
+            },
+          },
+        ],
+      });
+
+      await waitFor(async () => {
+        const list = await client.listTools();
+        return list.tools.some((t) => t.name === 'get_product') ? true : undefined;
+      });
+
+      const list = await client.listTools();
+      const tool = list.tools.find((t) => t.name === 'get_product');
+      expect(tool).toBeTruthy();
+      expect(tool?._meta).toEqual({
+        ui: {
+          resourceUri: 'ui://bellaroma/product-card.html',
+          preferredFrameSize: ['480px', '640px'],
+        },
+        'mcp-apps/widget': 'product-card',
+      });
+
+      ws.close();
+      await cleanup();
+    });
+
+    it('preserves `_meta` on top-level dynamic tools (direct mode)', async () => {
+      const { bridge, client, cleanup } = await createConnectedRelay({ exposeTools: 'direct' });
+
+      const ws = await connectBrowser(bridge, {
+        tabId: 'tab-meta-direct',
+        url: 'https://example.com',
+        tools: [
+          {
+            name: 'show_card',
+            _meta: { ui: { resourceUri: 'ui://x/card.html' } },
+          },
+        ],
+      });
+
+      await waitFor(async () => {
+        const list = await client.listTools();
+        return list.tools.some((t) => t.name === 'show_card') ? true : undefined;
+      });
+
+      const list = await client.listTools();
+      const tool = list.tools.find((t) => t.name === 'show_card');
+      expect(tool?._meta).toEqual({ ui: { resourceUri: 'ui://x/card.html' } });
+
+      ws.close();
+      await cleanup();
+    });
+
+    it('`direct` mode still routes resources/list end-to-end', async () => {
+      const { bridge, client, cleanup } = await createConnectedRelay({ exposeTools: 'direct' });
+
+      const ws = await connectBrowser(bridge, {
+        tabId: 'tab-res',
+        url: 'https://example.com',
+        tools: [{ name: 'render_card', _meta: { ui: { resourceUri: 'ui://app/card.html' } } }],
+      });
+
+      ws.send(
+        JSON.stringify({
+          type: 'resources/list',
+          resources: [
+            {
+              uri: 'ui://app/card.html',
+              name: 'card widget',
+              mimeType: 'text/html;profile=mcp-app',
+            },
+          ],
+        })
+      );
+
+      await waitFor(() => (bridge.listResources().length > 0 ? true : undefined));
+
+      const resList = await client.listResources();
+      expect(resList.resources).toHaveLength(1);
+      expect(resList.resources[0]?.uri).toBe('ui://app/card.html');
+      expect(resList.resources[0]?.mimeType).toBe('text/html;profile=mcp-app');
+
+      ws.close();
+      await cleanup();
+    });
+
+    it('emits tools/list_changed AND resources/list_changed when a source connects', async () => {
+      const { bridge, client, cleanup } = await createConnectedRelay({ exposeTools: 'direct' });
+
+      const counters = { tools: 0, resources: 0 };
+      client.fallbackNotificationHandler = async (notification) => {
+        if (notification.method === 'notifications/tools/list_changed') {
+          counters.tools += 1;
+        } else if (notification.method === 'notifications/resources/list_changed') {
+          counters.resources += 1;
+        }
+      };
+
+      const ws = await connectBrowser(bridge, {
+        tabId: 'tab-events',
+        url: 'https://example.com',
+        tools: [{ name: 'evt_tool', _meta: { ui: { resourceUri: 'ui://evt/x.html' } } }],
+      });
+
+      ws.send(
+        JSON.stringify({
+          type: 'resources/list',
+          resources: [{ uri: 'ui://evt/x.html', name: 'x' }],
+        })
+      );
+
+      await waitFor(() => (counters.tools > 0 && counters.resources > 0 ? true : undefined));
+      expect(counters.tools).toBeGreaterThan(0);
+      expect(counters.resources).toBeGreaterThan(0);
+
+      ws.close();
+      await cleanup();
+    });
+
+    it('emits tools/list_changed and resources/list_changed when a source disconnects', async () => {
+      const { bridge, client, cleanup } = await createConnectedRelay({ exposeTools: 'direct' });
+
+      const ws = await connectBrowser(bridge, {
+        tabId: 'tab-bye',
+        url: 'https://example.com',
+        tools: [{ name: 'bye_tool', _meta: { ui: { resourceUri: 'ui://bye/x.html' } } }],
+      });
+
+      ws.send(
+        JSON.stringify({
+          type: 'resources/list',
+          resources: [{ uri: 'ui://bye/x.html', name: 'x' }],
+        })
+      );
+
+      await waitFor(async () => {
+        const list = await client.listTools();
+        return list.tools.some((t) => t.name === 'bye_tool') ? true : undefined;
+      });
+      await waitFor(() => (bridge.listResources().length > 0 ? true : undefined));
+
+      // Start counting AFTER connect-time notifications so we measure only the
+      // disconnect side.
+      const counters = { tools: 0, resources: 0 };
+      client.fallbackNotificationHandler = async (notification) => {
+        if (notification.method === 'notifications/tools/list_changed') {
+          counters.tools += 1;
+        } else if (notification.method === 'notifications/resources/list_changed') {
+          counters.resources += 1;
+        }
+      };
+
+      ws.close();
+
+      await waitFor(() => (counters.tools > 0 && counters.resources > 0 ? true : undefined));
+
+      const toolsAfter = await client.listTools();
+      expect(toolsAfter.tools.some((t) => t.name === 'bye_tool')).toBe(false);
+      const resourcesAfter = await client.listResources();
+      expect(resourcesAfter.resources).toHaveLength(0);
+
+      await cleanup();
+    });
+
+    it('disambiguates tool names by tab when two sources expose the same name', async () => {
+      const { bridge, client, cleanup } = await createConnectedRelay({ exposeTools: 'direct' });
+
+      // Use tab ids whose first 4 sanitized chars differ, since
+      // buildPublicToolName truncates the suffix to 4 chars.
+      const wsA = await connectBrowser(bridge, {
+        tabId: 'alpha-1',
+        url: 'https://a.example.com',
+        tools: [{ name: 'add_to_cart' }],
+      });
+      const wsB = await connectBrowser(bridge, {
+        tabId: 'bravo-2',
+        url: 'https://b.example.com',
+        tools: [{ name: 'add_to_cart' }],
+      });
+
+      await waitFor(() => (bridge.registry.listSources().length >= 2 ? true : undefined));
+      await waitFor(async () => {
+        const list = await client.listTools();
+        return list.tools.length >= 2 ? true : undefined;
+      });
+
+      const list = await client.listTools();
+      const names = list.tools.map((t) => t.name);
+      // Per registry.rebuildPublicNames, both providers get tab-suffixed names
+      // when there is more than one tab with the same originalName.
+      expect(names.every((n) => n !== 'add_to_cart')).toBe(true);
+      expect(names.some((n) => n.startsWith('add_to_cart_'))).toBe(true);
+      expect(names.length).toBe(2);
+      // Each suffixed name should be unique.
+      expect(new Set(names).size).toBe(names.length);
+
+      wsA.close();
+      wsB.close();
       await cleanup();
     });
   });

@@ -8,6 +8,32 @@ describe('parseCliOptions', () => {
     expect(options.port).toBe(9333);
     expect(options.portExplicitlySet).toBe(false);
     expect(options.allowedOrigins).toEqual(['*']);
+    expect(options.exposeTools).toBe('both');
+  });
+
+  it('parses --expose-tools=direct', () => {
+    const options = parseCliOptions(['--expose-tools', 'direct']);
+    expect(options.exposeTools).toBe('direct');
+  });
+
+  it('parses --expose-tools=wrapped', () => {
+    const options = parseCliOptions(['--expose-tools', 'wrapped']);
+    expect(options.exposeTools).toBe('wrapped');
+  });
+
+  it('parses --expose-tools=both', () => {
+    const options = parseCliOptions(['--expose-tools', 'both']);
+    expect(options.exposeTools).toBe('both');
+  });
+
+  it('throws for invalid --expose-tools value', () => {
+    expect(() => parseCliOptions(['--expose-tools', 'bogus'])).toThrow(
+      /Invalid --expose-tools value "bogus"/
+    );
+  });
+
+  it('throws when --expose-tools is missing a value', () => {
+    expect(() => parseCliOptions(['--expose-tools'])).toThrow('Missing value for --expose-tools');
   });
 
   it('parses --host flag', () => {

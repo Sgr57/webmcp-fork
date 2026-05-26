@@ -31,6 +31,7 @@ const bridgeOptions = {
 
 const relay = new LocalRelayMcpServer({
   bridgeOptions,
+  exposeTools: options.exposeTools,
 });
 
 try {
@@ -64,6 +65,7 @@ if (relay.bridge.mode === 'server') {
     `[webmcp-local-relay] client mode: proxying through existing relay at ws://${options.host}:${relay.bridge.port}\n`
   );
 }
+process.stderr.write(`[webmcp-local-relay] expose-tools mode: ${options.exposeTools}\n`);
 
 /**
  * Gracefully shuts down bridge and MCP server for process termination signals.
